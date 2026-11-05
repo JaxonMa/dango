@@ -7,7 +7,8 @@ from __future__ import annotations
 import random
 import unittest
 
-import main as game
+import dango_core as game
+import windows_app
 
 
 def make_platform(
@@ -324,7 +325,7 @@ class RectAndMonitorTests(unittest.TestCase):
 
     def test_platform_is_live_without_element(self) -> None:
         platform = make_platform(0, game.Rect(0, 0, 100, 100))
-        self.assertTrue(game.platform_is_live(platform))
+        self.assertTrue(windows_app.platform_is_live(platform))
 
     def test_platform_is_live_detects_missing_element(self) -> None:
         class FakeRect:
@@ -339,7 +340,7 @@ class RectAndMonitorTests(unittest.TestCase):
 
         platform = make_platform(0, game.Rect(0, 0, 100, 100))
         platform.element = FakeElement()
-        self.assertTrue(game.platform_is_live(platform))
+        self.assertTrue(windows_app.platform_is_live(platform))
 
         class MovedElement(FakeElement):
             class BoundingRectangle:
@@ -349,7 +350,7 @@ class RectAndMonitorTests(unittest.TestCase):
                 bottom = 600
 
         platform.element = MovedElement()
-        self.assertFalse(game.platform_is_live(platform))
+        self.assertFalse(windows_app.platform_is_live(platform))
 
 
 if __name__ == "__main__":
