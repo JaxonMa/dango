@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-Dango Jump itself is distributed under the MIT License (see `LICENSE`).
+Dango Circuit itself is distributed under the MIT License (see `LICENSE`).
 It installs and uses the following third-party Python packages:
 
 ## PySide6-Essentials (macOS)

@@ -155,7 +155,7 @@ class MacAXScanTests(unittest.TestCase):
             )
         self.assertEqual(ctx.exception.kind, "timeout")
 
-    def test_platform_is_live_detects_movement_disable_and_hide(self) -> None:
+    def test_platform_is_live_detects_movement_and_hide(self) -> None:
         node = FakeNode("AXButton", core.Rect(100, 100, 220, 140), title="ok")
         result = self.scan(FakeNode(children=[node]))
         self.assertEqual(len(result.platforms), 1)
@@ -167,8 +167,9 @@ class MacAXScanTests(unittest.TestCase):
         self.assertFalse(macos_ax.platform_is_live_ax(platform))
 
         node._frame = core.Rect(100, 100, 220, 140)
+        # 禁用但位置仍有效的控件不作为“布局变化”处理，避免误重建路线。
         node.enabled = False
-        self.assertFalse(macos_ax.platform_is_live_ax(platform))
+        self.assertTrue(macos_ax.platform_is_live_ax(platform))
 
         node.enabled = True
         node.hidden = True

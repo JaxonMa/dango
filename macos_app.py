@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""macos_app — Dango Jump 的 macOS PySide6 透明覆盖层。
+"""macos_app — Dango Circuit 的 macOS PySide6 透明覆盖层。
 
 实现要点：
     * Qt 无边框、全屏、置顶、逐像素透明窗口；
@@ -43,25 +43,37 @@ from dango_core import (
     FPS_MS,
     GRAVITY,
     GameModel,
-    LIMIT_RETRIES,
     LevelError,
     MAX_DT,
-    MAX_RETRIES,
     MONITOR_INTERVAL_MS,
     Particle,
     Rect,
+    RunConfig,
+    RunResult,
     STATE_AIRBORNE,
     STATE_CHARGING,
+    STATE_READY,
+    STAR_BONUS,
     ScanError,
     ScanResult,
     UpdateEvents,
     clamp,
-    generate_level,
+    generate_course,
+    generate_remaining_checkpoints,
     jump_distance,
+    pick_bonus_stars,
     platform_display_name,
+    rects_differ,
     startup_countdown,
     trajectory_points,
     truncate_text,
+)
+from dango_audio import SoundPlayer
+from dango_progress import (
+    Progress,
+    load_progress,
+    record_result,
+    save_progress,
 )
 from macos_ax import (
     MacTargetApp,
@@ -70,11 +82,12 @@ from macos_ax import (
     activate_current_app,
     get_frontmost_app,
     open_accessibility_settings,
-    platform_is_live_ax,
+    read_platform_frame_ax,
     raise_window,
     refresh_target_window,
     scan_desktop,
     scan_target,
+    update_platform_from_frame_ax,
 )
 
 
@@ -99,6 +112,8 @@ Q_AMBER = qc("#FBBF24")
 Q_AMBER_SOFT = qc("#FDE68A")
 Q_GREEN = qc("#34D399")
 Q_RED = qc("#FB7185")
+Q_STAR = qc("#FCD34D")
+Q_HEART = qc("#FB7185")
 Q_TEXT = qc("#F8FAFC")
 Q_MUTED = qc("#94A3B8")
 Q_LINE = qc("#334155")
@@ -130,16 +145,26 @@ class MacOverlay(QWidget):
         scope: str,
         target_app: Optional[MacTargetApp],
         *,
-        limit_retries: bool = LIMIT_RETRIES,
-        max_retries: int = MAX_RETRIES,
+        run_config: Optional[RunConfig] = None,
+        muted: bool = False,
     ) -> None:
         super().__init__()
         self.screen = screen
         self.available = available
         self.scope = scope
         self.target_app = target_app
-        self.limit_retries = limit_retries
-        self.max_retries = max_retries
+        self.run_config = run_config or RunConfig()
+        self.progress: Progress = load_progress()
+        if muted:
+            self.progress.muted = True
+            save_progress(self.progress)
+        self.sound = SoundPlayer(muted=self.progress.muted)
+        self._best_score = self.progress.best_score
+        self._new_best = False
+        self._run_result: Optional[RunResult] = None
+        self._popups: list[dict[str, Any]] = []
+        self._squash = 0.0
+        self._repairing = False
 
         self.running = True
         self.mode = "scanning"       # scanning / permission / playing / error / victory / game_over
@@ -163,7 +188,7 @@ class MacOverlay(QWidget):
         self._static_cache: Optional[QPixmap] = None
         self._static_dirty = True
 
-        self.setWindowTitle("Dango Jump")
+        self.setWindowTitle("Dango Circuit")
         # 不使用 Qt.Tool：macOS 的 utility window 在 App 失焦时可能被系统
         # 自动隐藏，导致暂停提示也一起消失。普通无边框窗口会保持可见。
         self.setWindowFlags(
@@ -358,6 +383,7 @@ class MacOverlay(QWidget):
         self._monitor_timer.stop()
         self._release_timer.stop()
         self._pulse_timer.stop()
+        save_progress(self.progress)
         app = self.target_app
         if app is not None and app.pid:
             try:
@@ -430,7 +456,7 @@ class MacOverlay(QWidget):
                     refresh_target_window(self.target_app)
                 result = scan_target(self.target_app, self.screen)
             result = self._filter_playable(result)
-            level = generate_level(result.platforms)
+            course = generate_course(result.platforms, self.run_config)
         except ScanError as exc:
             self.scanning = False
             if str(exc.kind) == "permission":
@@ -451,22 +477,21 @@ class MacOverlay(QWidget):
             QApplication.restoreOverrideCursor()
 
         self._last_scan = result
-        preserve = (not reset_stats) and self.model is not None
-        if preserve:
-            self.model.load_level(level, preserve_stats=True)
-        else:
-            self.model = GameModel(
-                level,
-                self.screen,
-                limit_retries=self.limit_retries,
-                max_retries=self.max_retries,
-            )
+        self._run_result = None
+        self._new_best = False
+        self.model = GameModel(course, self.screen, self.run_config)
         self.scanning = False
         self.mode = "playing"
         self._invalidate_static()
         self._particles.clear()
+        self._popups.clear()
         self._space_down = False
         self._toast_text = ""
+        if course.shortened:
+            self.show_toast(
+                f"可用控件不足，路线缩短为 {len(course.checkpoints)} 站。",
+                2.2,
+            )
         self._activate_self()
         self._monitor_timer.start()
         self.update()
@@ -539,17 +564,106 @@ class MacOverlay(QWidget):
             or self.model is None
             or self.scanning
             or self.focus_lost
+            or self._repairing
         ):
             return
-        target = self.model.level.target
-        current = self.model.current
-        target_ok = platform_is_live_ax(target)
-        current_ok = current.uid == target.uid or platform_is_live_ax(current)
-        if not target_ok or not current_ok:
-            self._begin_scan(
-                reset_stats=False,
-                reason="控件已消失或移动，正在重新生成关卡…",
+        model = self.model
+        missing: set[int] = set()
+        changed = False
+        for platform in model.course.platforms:
+            previous = platform.rect
+            frame = read_platform_frame_ax(platform)
+            if frame is None:
+                missing.add(platform.uid)
+            else:
+                if update_platform_from_frame_ax(platform, frame, self.screen):
+                    if rects_differ(previous, platform.rect, 0):
+                        changed = True
+
+        if model.state == STATE_READY:
+            new_x = model.current.rect.center_x
+            new_feet = float(model.current.rect.top)
+            if new_x != model.char_x or new_feet != model.char_feet:
+                model.char_x = new_x
+                model.char_feet = new_feet
+                changed = True
+
+        target = model.next_target
+        current = model.current
+        route_missing = bool(
+            (target is not None and target.uid in missing)
+            or (current is not None and current.uid in missing)
+            or any(
+                cp.uid in missing
+                for cp in model.course.checkpoints[model.checkpoint_index:]
             )
+        )
+        if route_missing:
+            self._repair_route()
+            return
+        if changed:
+            self._invalidate_static()
+            self.update()
+
+    def _repair_route(self) -> None:
+        if self._repairing or self.model is None:
+            return
+        self._repairing = True
+        self.show_toast("桌面布局已变化，正在更新剩余路线…", 2.0)
+        try:
+            if self.scope == "desktop":
+                result = scan_desktop(self.screen)
+            else:
+                if self.target_app is None:
+                    raise ScanError("没有可读取的前台 App。", kind="window")
+                result = scan_target(self.target_app, self.screen)
+            result = self._filter_playable(result)
+            platforms = result.platforms
+            old = self.model
+            new_current = _match_platform(old.current, platforms)
+            new_respawn = _match_platform(old.respawn_platform, platforms)
+            start = new_current or new_respawn
+            if start is None:
+                raise LevelError("桌面布局变化过大，无法定位当前平台。")
+            remaining = max(1, len(old.course.checkpoints) - old.checkpoint_index)
+            rng = random.Random(self.run_config.seed)
+            new_checkpoints = generate_remaining_checkpoints(
+                platforms,
+                start,
+                remaining,
+                rng,
+                excluded_uids={
+                    p.uid for p in old.course.checkpoints[: old.checkpoint_index]
+                },
+            )
+            new_stars = pick_bonus_stars(
+                platforms,
+                [start] + new_checkpoints,
+                max(0, int(self.run_config.star_count)),
+                rng,
+            )
+            if old.state != STATE_READY:
+                old.reset_to_respawn()
+            old.replace_pending_checkpoints(
+                platforms,
+                new_checkpoints,
+                new_stars,
+                current_platform=new_current or new_respawn,
+                respawn_platform=new_respawn or new_current,
+            )
+            self._invalidate_static()
+            self._refresh_hud()
+            self.update()
+            self.show_toast("路线已更新，进度保留。", 2.0)
+        except (ScanError, LevelError) as exc:
+            self._show_error_card(str(exc))
+            return
+        except Exception as exc:
+            traceback.print_exc()
+            self._show_error_card(f"更新路线失败：{exc}")
+            return
+        finally:
+            self._repairing = False
 
     # =========================================================================
     # 输入
@@ -559,6 +673,13 @@ class MacOverlay(QWidget):
         key = event.key()
         if key == Qt.Key_Escape:
             self._quit()
+            event.accept()
+            return
+        if key == Qt.Key_M:
+            self.progress.muted = not self.progress.muted
+            self.sound.set_muted(self.progress.muted)
+            save_progress(self.progress)
+            self.show_toast("音效已静音" if self.progress.muted else "音效已开启", 1.2)
             event.accept()
             return
 
@@ -693,6 +814,7 @@ class MacOverlay(QWidget):
             if self.mode == "playing" and self.model is not None:
                 animating = False
                 if not self.focus_lost:
+                    self.model.advance_clock(dt)
                     if self.model.state == STATE_CHARGING:
                         self.model.update_charge(now)
                         animating = True
@@ -703,6 +825,10 @@ class MacOverlay(QWidget):
                 if self._particles:
                     self._update_particles(dt)
                     animating = True
+                if self._popups:
+                    self._update_popups(dt)
+                    animating = True
+                self._squash = max(0.0, self._squash - dt)
                 # 空闲时不重绘整块全屏透明层，避免无意义的 GPU/CPU 合成。
                 if animating and now - self._last_repaint >= self._paint_interval:
                     self._last_repaint = now
@@ -716,17 +842,51 @@ class MacOverlay(QWidget):
             self.update()
 
     def _handle_events(self, events: UpdateEvents) -> None:
-        if self.model is None:
+        model = self.model
+        if model is None:
             return
         if events.landed is not None:
             self._invalidate_static()
             self._spawn_particles(
-                self.model.char_x,
-                self.model.char_feet,
+                model.char_x,
+                model.char_feet,
                 9,
                 COL_AQUA_SOFT,
             )
+            self._squash = 0.14
+            self.sound.play("land")
+        if events.star is not None:
+            self.sound.play("star")
+            self._spawn_popup(
+                events.star.rect.center_x,
+                events.star.rect.top - 40,
+                f"★ +{STAR_BONUS}",
+                Q_STAR,
+            )
+        if events.checkpoint is not None:
+            if events.perfect:
+                self.sound.play("perfect")
+            else:
+                self.sound.play("checkpoint")
+            bits = [f"+{events.score_delta}"]
+            if events.perfect:
+                bits.append("PERFECT")
+            if events.direct:
+                bits.append("DIRECT")
+            if events.combo > 1:
+                bits.append(f"COMBO x{events.combo}")
+            self._spawn_popup(
+                events.checkpoint.rect.center_x,
+                events.checkpoint.rect.top - 58,
+                "  ".join(bits),
+                Q_AMBER if events.perfect else Q_AQUA_SOFT,
+            )
+            self._invalidate_static()
+            self._refresh_hud()
+        elif events.star is not None:
+            self._refresh_hud()
         if events.victory:
+            self._finish_run(completed=True)
             self.mode = "victory"
             self._space_down = False
             self._monitor_timer.stop()
@@ -735,6 +895,7 @@ class MacOverlay(QWidget):
             self._release_timer.start(320)
             return
         if events.game_over:
+            self._finish_run(completed=False)
             self.mode = "game_over"
             self._space_down = False
             self._monitor_timer.stop()
@@ -743,17 +904,73 @@ class MacOverlay(QWidget):
             self._release_timer.start(320)
             return
         if events.fell:
+            self.sound.play("fall")
+            if model.hearts_left is None:
+                message = "坠落！练习模式无限心，已回到检查点。"
+            elif model.hearts_left > 0:
+                message = f"坠落！损失一颗心，剩余 {model.hearts_left} 颗。"
+            else:
+                message = "坠落！心数耗尽。"
             self._invalidate_static()
-            self.show_toast(
-                "坠落！已回到起点。" if not self.model.limit_retries else "坠落！损失一次机会。",
-                1.8,
-            )
+            self.show_toast(message, 1.9)
+            self._refresh_hud()
+
+    def _finish_run(self, completed: bool) -> None:
+        if self._run_result is not None or self.model is None:
+            return
+        result = self.model.result
+        if result is None:
+            return
+        self._run_result = result
+        updated, new_best = record_result(
+            self.progress,
+            score=result.score,
+            elapsed=result.elapsed,
+            stars=result.rating,
+            completed=result.completed,
+        )
+        self.progress = updated
+        save_progress(updated)
+        self._best_score = updated.best_score
+        self._new_best = new_best
+        self.sound.play("victory" if completed else "game_over")
 
     def show_toast(self, text: str, seconds: float = 1.8) -> None:
         self._toast_text = text
         self._toast_until = time.perf_counter() + seconds
         self.update()
         QTimer.singleShot(int(seconds * 1000) + 40, self.update)
+
+    def _spawn_popup(self, x: float, y: float, text: str, color: QColor) -> None:
+        self._popups.append(
+            {
+                "x": x,
+                "y": y,
+                "text": text,
+                "color": color,
+                "life": 1.25,
+                "max_life": 1.25,
+            }
+        )
+
+    def _update_popups(self, dt: float) -> None:
+        alive = []
+        for popup in self._popups:
+            popup["life"] -= dt
+            popup["y"] -= 28.0 * dt
+            if popup["life"] > 0:
+                alive.append(popup)
+        self._popups = alive
+
+    def _paint_popups(self, p: QPainter) -> None:
+        for popup in self._popups:
+            ratio = max(0.0, float(popup["life"]) / float(popup["max_life"]))
+            color = popup["color"] if ratio > 0.35 else Q_MUTED
+            text = str(popup["text"])
+            width = self._text_width(p, text, self._font_small_bold) + 28
+            rect = QRectF(popup["x"] - width / 2, popup["y"] - 13, width, 26)
+            self._rounded(p, rect, 8, Q_PANEL_2, color, 1)
+            self._text(p, rect, text, self._font_small_bold, color)
 
     def _spawn_particles(self, x: float, y: float, count: int, color: str) -> None:
         rng = random.Random()
@@ -809,15 +1026,18 @@ class MacOverlay(QWidget):
                 self._paint_scanning(painter)
             elif self.mode == "error":
                 self._paint_error(painter)
-            elif self.mode == "victory":
-                self._paint_victory(painter)
-            elif self.mode == "game_over":
-                self._paint_game_over(painter)
+            elif self.mode in ("victory", "game_over"):
+                self._paint_result(painter)
         finally:
             painter.end()
 
     def _invalidate_static(self) -> None:
         self._static_dirty = True
+
+    def _refresh_hud(self) -> None:
+        if self.model is not None:
+            self._invalidate_static()
+            self.update()
 
     def _ensure_static_cache(self) -> None:
         if not self._static_dirty and self._static_cache is not None:
@@ -851,10 +1071,12 @@ class MacOverlay(QWidget):
         if self._static_cache is not None:
             p.drawPixmap(0, 0, self._static_cache)
         self._paint_target_outline(p)
+        self._paint_trail(p)
         self._paint_trajectory(p)
         self._paint_particles(p)
         self._paint_direction(p)
         self._paint_character(p)
+        self._paint_popups(p)
         self._paint_charge_ui(p)
         self._paint_toast(p)
         if self.focus_lost:
@@ -909,32 +1131,109 @@ class MacOverlay(QWidget):
         pen.setDashPattern([1.0, 4.0])
         p.setPen(pen)
         p.setBrush(Qt.NoBrush)
-        for platform in self.model.level.platforms:
+        for platform in self.model.course.platforms:
             r = platform.rect
             p.drawRect(QRectF(r.left, r.top, r.width, r.height))
+
+    def _paint_badge(
+        self,
+        p: QPainter,
+        x: float,
+        y: float,
+        text: str,
+        fill: QColor,
+        outline: QColor,
+        color: QColor,
+        width: float = 30.0,
+    ) -> None:
+        rect = QRectF(x, y - 10, width, 20)
+        self._pill(p, rect, fill, outline, 7)
+        self._text(p, rect, text, self._font_small_bold, color)
 
     def _paint_markers_static(self, p: QPainter) -> None:
         if self.model is None:
             return
-        level = self.model.level
+        course = self.model.course
 
         # 起点
-        start = level.start.rect
-        sx = max(8, start.left + 4)
-        sy = max(self.available.top + 26, start.top - 24)
+        start_rect = course.start.rect
+        sx = max(8, start_rect.left + 4)
+        sy = max(self.available.top + 26, start_rect.top - 24)
         label_rect = QRectF(sx - 2, sy - 13, 52, 26)
         self._pill(p, label_rect, Q_PANEL, Q_AQUA_DIM, 8)
         self._text(p, label_rect, "起点", self._font_small_bold, Q_AQUA)
-        triangle = QPolygonF(
-            [
-                QPointF(sx + 24, start.top - 1),
-                QPointF(sx + 17, start.top - 11),
-                QPointF(sx + 31, start.top - 11),
-            ]
-        )
         p.setBrush(Q_AQUA)
         p.setPen(QPen(Q_INK, 1.0))
-        p.drawPolygon(triangle)
+        p.drawPolygon(
+            QPolygonF(
+                [
+                    QPointF(sx + 24, start_rect.top - 1),
+                    QPointF(sx + 17, start_rect.top - 11),
+                    QPointF(sx + 31, start_rect.top - 11),
+                ]
+            )
+        )
+
+        # 已完成检查点
+        for checkpoint in course.checkpoints[: self.model.checkpoint_index]:
+            r = checkpoint.rect
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(Q_GREEN, 2.0))
+            p.drawRect(QRectF(r.left, r.top, r.width, r.height))
+            self._paint_badge(
+                p,
+                r.left + 4,
+                max(self.available.top + 20, r.top - 16),
+                "✓",
+                Q_PANEL,
+                Q_GREEN,
+                Q_GREEN,
+                24,
+            )
+
+        # 未来检查点
+        for index in range(self.model.checkpoint_index + 1, len(course.checkpoints)):
+            checkpoint = course.checkpoints[index]
+            r = checkpoint.rect
+            is_goal = index == len(course.checkpoints) - 1
+            pen = QPen(Q_MUTED, 1.0)
+            pen.setDashPattern([3.0, 5.0])
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(QRectF(r.left, r.top, r.width, r.height))
+            self._paint_badge(
+                p,
+                r.left + 4,
+                max(self.available.top + 20, r.top - 16),
+                "GOAL" if is_goal else str(index + 1),
+                Q_PANEL,
+                Q_AMBER if is_goal else Q_LINE,
+                Q_AMBER if is_goal else Q_MUTED,
+                42 if is_goal else 26,
+            )
+
+        # 当前目标标签（描边在动态层）
+        target = self.model.next_target
+        if target is not None:
+            tr = target.rect
+            label_text = (
+                f"下一站 {self.model.checkpoint_index + 1}/"
+                f"{len(course.checkpoints)} · {platform_display_name(target)}"
+            )
+            label_text = truncate_text(label_text, 32)
+            width = min(
+                400.0,
+                max(170.0, self._text_width(p, label_text, self._font_small_bold) + 34.0),
+            )
+            cx = clamp(
+                tr.center_x,
+                12 + width / 2,
+                self.screen.right - 12 - width / 2,
+            )
+            ly = tr.top - 26 if tr.top > self.available.top + 50 else tr.bottom + 26
+            label = QRectF(cx - width / 2, ly - 15, width, 30)
+            self._pill(p, label, Q_PANEL, Q_AMBER, 9)
+            self._text(p, label, label_text, self._font_small_bold, Q_AMBER_SOFT)
 
         # 当前平台
         cur = self.model.current.rect
@@ -942,21 +1241,31 @@ class MacOverlay(QWidget):
         p.setPen(QPen(Q_AQUA, 2.0))
         p.drawRect(QRectF(cur.left, cur.top, cur.width, cur.height))
 
-        # 目标标签（目标描边是动态闪烁的，不放进静态缓存）
-        target = level.target.rect
-        label_text = f"目标 · {platform_display_name(level.target)}"
-        label_text = truncate_text(label_text, 32)
-        width = min(380.0, max(160.0, self._text_width(p, label_text, self._font_small_bold) + 34.0))
-        cx = clamp(target.center_x, 12 + width / 2, self.screen.right - 12 - width / 2)
-        ly = target.top - 26 if target.top > self.available.top + 50 else target.bottom + 26
-        label = QRectF(cx - width / 2, ly - 15, width, 30)
-        self._pill(p, label, Q_PANEL, Q_AMBER, 9)
-        self._text(p, label, label_text, self._font_small_bold, Q_AMBER_SOFT)
+        # 可选星星
+        for star in course.bonus_stars:
+            if star.uid in self.model.collected_star_uids:
+                continue
+            r = star.rect
+            pen = QPen(Q_STAR, 1.0)
+            pen.setDashPattern([2.0, 5.0])
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            p.drawRect(QRectF(r.left, r.top, r.width, r.height))
+            self._paint_badge(
+                p,
+                r.right - 28,
+                max(self.available.top + 20, r.top - 16),
+                "★",
+                Q_PANEL,
+                Q_STAR,
+                Q_STAR,
+                24,
+            )
 
     def _paint_target_outline(self, p: QPainter) -> None:
-        if self.model is None:
+        if self.model is None or self.model.next_target is None:
             return
-        target = self.model.level.target.rect
+        target = self.model.next_target.rect
         pulse = int(time.perf_counter() * 2.5) % 2
         color = Q_AMBER if pulse == 0 else Q_AMBER_SOFT
         outer = QRectF(target.left - 3, target.top - 3, target.width + 6, target.height + 6)
@@ -978,7 +1287,6 @@ class MacOverlay(QWidget):
         top = self.available.top + 12
         h = 62
 
-        # 品牌
         brand = QRectF(20, top, 310, h)
         self._pill(p, brand, Q_PANEL, Q_LINE, 12)
         self._text(
@@ -989,17 +1297,15 @@ class MacOverlay(QWidget):
             Q_AQUA,
             Qt.AlignLeft | Qt.AlignVCenter,
         )
-        scope_text = self._scope_label()
         self._text(
             p,
             QRectF(38, top + 32, 274, 20),
-            truncate_text(scope_text, 38),
+            truncate_text(self._scope_label(), 38),
             self._font_small,
             Q_MUTED,
             Qt.AlignLeft | Qt.AlignVCenter,
         )
 
-        # 目标
         tx1 = max(350, w / 2 - 245)
         tx2 = min(w - 330, w / 2 + 245)
         if tx2 - tx1 < 280:
@@ -1009,37 +1315,41 @@ class MacOverlay(QWidget):
         self._pill(p, target_panel, Q_PANEL, Q_AMBER, 12)
         self._text(
             p,
-            QRectF(tx1, top + 5, tx2 - tx1, 20),
-            "当前目标",
+            QRectF(tx1, top + 4, tx2 - tx1, 20),
+            f"检查点 {self.model.checkpoint_index}/{len(self.model.course.checkpoints)} · 下一站",
             self._font_small,
             Q_AMBER,
         )
+        target = self.model.next_target
         self._text(
             p,
             QRectF(tx1 + 8, top + 25, tx2 - tx1 - 16, 28),
-            platform_display_name(self.model.level.target),
+            platform_display_name(target) if target is not None else "全部完成",
             self._font_body_bold,
             Q_TEXT,
         )
 
-        # 统计
-        stats = QRectF(w - 310, top, 290, h)
+        stats = QRectF(w - 330, top, 310, h)
         self._pill(p, stats, Q_PANEL, Q_LINE, 12)
-        stat_text = f"跳跃 {self.model.jumps}  ·  坠落 {self.model.falls}"
-        if self.model.limit_retries:
-            stat_text += f"  ·  剩余 {self.model.remaining_retries}"
         self._text(
             p,
-            QRectF(stats.left() + 14, stats.top() + 6, stats.width() - 28, 24),
-            stat_text,
+            QRectF(stats.left() + 14, stats.top() + 6, stats.width() - 28, 22),
+            f"分数 {self.model.score}   ·   连击 x{self.model.combo_multiplier:.1f}",
             self._font_small_bold,
             Q_TEXT,
             Qt.AlignLeft | Qt.AlignVCenter,
         )
+        hearts = (
+            "♥ 无限"
+            if self.model.hearts_left is None
+            else "♥" * self.model.hearts_left
+            + "♡" * max(0, self.run_config.hearts - self.model.hearts_left)
+        )
         self._text(
             p,
             QRectF(stats.left() + 14, stats.top() + 32, stats.width() - 28, 20),
-            "R 新关卡 · Esc 退出",
+            f"{hearts}   ·   ★ {self.model.stars_collected}/{self.model.stars_total}"
+            f"   ·   BEST {self._best_score}",
             self._font_small,
             Q_MUTED,
             Qt.AlignLeft | Qt.AlignVCenter,
@@ -1107,6 +1417,20 @@ class MacOverlay(QWidget):
             rect = QRectF(x + self.model.direction * 62 - 30, y - 10, 60, 20)
             self._text(p, rect, "蓄力", self._font_small_bold, Q_AQUA_SOFT)
 
+    def _paint_trail(self, p: QPainter) -> None:
+        if self.model is None or self.model.state != STATE_AIRBORNE:
+            return
+        direction = 1 if self.model.direction >= 0 else -1
+        p.setPen(Qt.NoPen)
+        for index in range(1, 5):
+            tx = self.model.char_x - direction * index * 9
+            ty = self.model.char_feet - CHAR_SIZE / 2 + index * 2
+            radius = max(1.0, 4.0 - index * 0.6)
+            p.setBrush(Q_AQUA_DIM)
+            p.drawEllipse(
+                QRectF(tx - radius, ty - radius, radius * 2, radius * 2)
+            )
+
     def _paint_trajectory(self, p: QPainter) -> None:
         if self.model is None or self.model.state != STATE_CHARGING:
             return
@@ -1138,11 +1462,19 @@ class MacOverlay(QWidget):
         full = charging and self.model.power >= 0.999
         outline = Q_AMBER if full else Q_LINE
         self._pill(p, QRectF(x1, y1, x2 - x1, y2 - y1), Q_PANEL, outline, 14)
+        self._text(
+            p,
+            QRectF(x2 - 128, y1 + 6, 112, 20),
+            f"用时 {self.model.elapsed:5.1f}s",
+            self._font_small,
+            Q_MUTED,
+            Qt.AlignRight | Qt.AlignVCenter,
+        )
 
         if charging:
             percent = int(round(self.model.power * 100))
             distance = int(round(jump_distance(self.model.power)))
-            label = f"蓄力 {percent:>3d}%   ·   预计 {distance:>4d} px"
+            label = f"蓄力 {percent:>3d}% · {distance:>4d}px"
             self._text(
                 p,
                 QRectF(x1 + 18, y1 + 8, x2 - x1 - 36, 22),
@@ -1171,7 +1503,7 @@ class MacOverlay(QWidget):
             self._text(
                 p,
                 QRectF(x1 + 12, y1 + 6, x2 - x1 - 24, y2 - y1 - 12),
-                "←  →  切换方向    ·    长按空格蓄力    ·    松开起跳",
+                "← → 换方向 · 空格蓄力 · 松开起跳 · M 静音",
                 self._font_body,
                 Q_TEXT,
             )
@@ -1439,94 +1771,120 @@ class MacOverlay(QWidget):
             card=card,
         )
 
-    def _paint_victory(self, p: QPainter) -> None:
+    def _format_time(self, seconds: float) -> str:
+        minutes = int(seconds // 60)
+        rest = seconds - minutes * 60
+        return f"{minutes:02d}:{rest:04.1f}"
+
+    def _paint_result(self, p: QPainter) -> None:
         self.card_buttons = []
-        card = self._paint_card_shell(p, Q_GREEN, height=390)
+        if self.model is None:
+            return
+        result = self._run_result or self.model.result
+        if result is None:
+            return
+        completed = result.completed
+        accent = Q_GREEN if completed else Q_RED
+        card = self._paint_card_shell(p, accent, height=400)
         rng = random.Random(7)
-        p.setPen(Qt.NoPen)
-        for _ in range(28):
-            x = rng.uniform(card.left() + 40, card.right() - 40)
-            y = rng.uniform(card.top() + 50, card.bottom() - 50)
-            color = rng.choice((Q_AQUA, Q_AMBER, Q_GREEN, Q_TEXT))
-            size = rng.uniform(2, 5)
-            p.setBrush(color)
-            p.drawEllipse(QRectF(x, y, size, size))
-        assert self.model is not None
+        if completed:
+            p.setPen(Qt.NoPen)
+            for _ in range(24):
+                x = rng.uniform(card.left() + 40, card.right() - 40)
+                y = rng.uniform(card.top() + 50, card.bottom() - 50)
+                color = rng.choice((Q_AQUA, Q_AMBER, Q_GREEN, Q_TEXT))
+                size = rng.uniform(2, 5)
+                p.setBrush(color)
+                p.drawEllipse(QRectF(x, y, size, size))
         self._text(
             p,
-            QRectF(card.left(), card.top() + 92, card.width(), 52),
-            "落点命中！",
+            QRectF(card.left(), card.top() + 72, card.width(), 48),
+            "巡回完成！" if completed else "体力耗尽",
             self._font_title,
-            Q_GREEN,
+            accent,
         )
         self._text(
             p,
-            QRectF(card.left() + 20, card.top() + 154, card.width() - 40, 28),
-            f"你落到了目标控件 · {platform_display_name(self.model.level.target)}",
-            self._font_body_bold,
+            QRectF(card.left(), card.top() + 128, card.width(), 38),
+            f"得分  {result.score}",
+            QFont("Menlo", 26, QFont.Weight.Bold),
             Q_TEXT,
         )
-        stats = (
-            f"跳跃 {self.model.jumps} 次   ·   坠落 {self.model.falls} 次"
-            f"   ·   剩余机会 {self.model.remaining_retries if self.model.limit_retries else '无限'}"
+        rating = "★" * result.rating + "☆" * (3 - result.rating)
+        self._text(
+            p,
+            QRectF(card.left(), card.top() + 170, card.width(), 32),
+            rating,
+            self._font_h1,
+            Q_AMBER if result.rating else Q_MUTED,
         )
         self._text(
             p,
-            QRectF(card.left(), card.top() + 194, card.width(), 24),
-            stats,
+            QRectF(card.left(), card.top() + 208, card.width(), 22),
+            f"用时 {self._format_time(result.elapsed)}   ·   "
+            f"Perfect {result.perfect_count}   ·   Direct {result.direct_count}",
             self._font_small,
             Q_MUTED,
         )
+        self._text(
+            p,
+            QRectF(card.left(), card.top() + 234, card.width(), 22),
+            f"检查点 {self.model.checkpoint_index}/{len(self.model.course.checkpoints)}"
+            f"   ·   星星 {result.stars_collected}/{result.stars_total}"
+            f"   ·   坠落 {result.falls}",
+            self._font_small_bold,
+            Q_TEXT,
+        )
+        best_text = f"本地最佳 {self._best_score}"
+        if self.progress.best_time is not None:
+            best_text += f"   ·   最快 {self._format_time(self.progress.best_time)}"
+        if self.progress.best_stars:
+            best_text += "   ·   " + "★" * self.progress.best_stars
+        if self._new_best:
+            best_text = "NEW BEST!   " + best_text
+        self._text(
+            p,
+            QRectF(card.left(), card.top() + 262, card.width(), 22),
+            best_text,
+            self._font_small_bold,
+            Q_AMBER if self._new_best else Q_MUTED,
+        )
         self._paint_buttons(
             p,
-            [("restart", "再玩一局"), ("quit", "退出")],
-            y=card.top() + 272,
+            [("restart", "再来一局"), ("quit", "退出")],
+            y=card.top() + 316,
             card=card,
         )
         self._text(
             p,
-            QRectF(card.left() + 20, card.bottom() - 52, card.width() - 40, 22),
+            QRectF(card.left() + 20, card.bottom() - 48, card.width() - 40, 20),
             "键盘焦点已释放；点击按钮继续，点击卡片后也可用 R / Esc。",
             self._font_small,
             Q_MUTED,
         )
 
-    def _paint_game_over(self, p: QPainter) -> None:
-        self.card_buttons = []
-        card = self._paint_card_shell(p, Q_AMBER, height=380)
-        assert self.model is not None
-        self._text(
-            p,
-            QRectF(card.left(), card.top() + 98, card.width(), 50),
-            "机会用尽",
-            self._font_title,
-            Q_AMBER,
-        )
-        self._text(
-            p,
-            QRectF(card.left(), card.top() + 162, card.width(), 28),
-            f"本局跳跃 {self.model.jumps} 次，坠落 {self.model.falls} 次。",
-            self._font_body,
-            Q_TEXT,
-        )
-        self._paint_buttons(
-            p,
-            [("restart", "再玩一局"), ("quit", "退出")],
-            y=card.top() + 264,
-            card=card,
-        )
-        self._text(
-            p,
-            QRectF(card.left() + 20, card.bottom() - 50, card.width() - 40, 22),
-            "键盘焦点已释放；点击按钮继续，点击卡片后也可用 R / Esc。",
-            self._font_small,
-            Q_MUTED,
-        )
 
-
-# =============================================================================
-# macOS 启动入口
-# =============================================================================
+def _match_platform(old: Any, platforms: Sequence[Any]) -> Optional[Any]:
+    same = [
+        p
+        for p in platforms
+        if p.name == old.name and p.control_type == old.control_type
+    ]
+    pool = same or list(platforms)
+    if not pool:
+        return None
+    candidate = min(
+        pool,
+        key=lambda p: abs(p.rect.center_x - old.rect.center_x)
+        + abs(p.rect.center_y - old.rect.center_y),
+    )
+    if not same:
+        distance = abs(candidate.rect.center_x - old.rect.center_x) + abs(
+            candidate.rect.center_y - old.rect.center_y
+        )
+        if distance > 180:
+            return None
+    return candidate
 
 
 def _screen_rects(screen: Any) -> tuple[Rect, Rect]:
@@ -1565,8 +1923,8 @@ def run_macos(args: Any) -> int:
             print(f"目标 App：{target_app.name} — {window_title}", flush=True)
 
         app = QApplication(sys.argv[:1])
-        app.setApplicationName("Dango Jump")
-        app.setApplicationDisplayName("Dango Jump")
+        app.setApplicationName("Dango Circuit")
+        app.setApplicationDisplayName("Dango Circuit")
         app.setQuitOnLastWindowClosed(True)
 
         primary = app.primaryScreen()
@@ -1580,8 +1938,8 @@ def run_macos(args: Any) -> int:
             usable,
             scope,
             target_app,
-            limit_retries=bool(args.limit_retries),
-            max_retries=max(1, int(args.max_retries)),
+            run_config=getattr(args, "run_config", None),
+            muted=bool(getattr(args, "mute", False)),
         )
         overlay.show()
         overlay.raise_()

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""dango_core — Dango Jump 的跨平台纯逻辑核心。
+"""dango_core — Dango Circuit 的跨平台纯逻辑核心。
 
 这里不导入 Tk、Qt、UI Automation 或 PyObjC；Windows 与 macOS 前端
 共享关卡生成、控件过滤、跳跃物理和状态机。
@@ -42,12 +42,33 @@ SCAN_MAX_NODES = 3000
 TARGET_MOVE_TOLERANCE = 6           # 目标/当前控件移动超过该值则重开，px
 MONITOR_INTERVAL_MS = 500           # 目标存活检查间隔
 
-# 重试 -------------------------------------------------------------------------
-LIMIT_RETRIES = False               # 是否限制坠落重试次数
+# 重试（旧配置，保留给 CLI 兼容层） ---------------------------------------------
+LIMIT_RETRIES = False
 MAX_RETRIES = 5
 
+# 巡回赛 -----------------------------------------------------------------------
+START_HEARTS = 3                    # 默认心数；坠落扣一颗
+COURSE_CHECKPOINTS = 4              # 默认检查点数（含终点）
+BONUS_STAR_COUNT = 2                # 每局可选星星数量
+MIN_CHECKPOINTS = 2                 # 至少两段，避免退化成单次胜利
+MAX_CHECKPOINTS = 7
+CHECKPOINT_MAX_WIDTH = 360          # 检查点优先选择可读的中小控件
+CHECKPOINT_MAX_HEIGHT = 180
+PERFECT_CENTER_RATIO = 0.30         # 落点在目标中央 30% 内算 Perfect
+CHECKPOINT_BASE_SCORE = 120
+CHECKPOINT_SCORE_STEP = 80
+PERFECT_BONUS = 60
+DIRECT_BONUS = 80
+STAR_BONUS = 150
+COMBO_MULTIPLIER_STEP = 0.20
+MAX_COMBO_MULTIPLIER = 1.80
+FINISH_HEART_BONUS = 300
+FINISH_TIME_BONUS_BASE = 2000
+FINISH_TIME_BONUS_RATE = 30
+COURSE_GENERATION_ATTEMPTS = 1600
+
 # 窗口与视觉 -------------------------------------------------------------------
-APP_NAME = "DANGO JUMP"
+APP_NAME = "DANGO CIRCUIT"
 TRANSPARENT_KEY = "#010203"         # Windows 色键；美术颜色不要使用该值
 FPS_MS = 16
 
@@ -61,6 +82,8 @@ COL_AMBER = "#FBBF24"
 COL_AMBER_SOFT = "#FDE68A"
 COL_GREEN = "#34D399"
 COL_RED = "#FB7185"
+COL_STAR = "#FCD34D"
+COL_HEART = "#FB7185"
 COL_TEXT = "#F8FAFC"
 COL_MUTED = "#94A3B8"
 COL_LINE = "#334155"
@@ -248,10 +271,27 @@ class Platform:
 
 
 @dataclass
-class Level:
+class Course:
+    """一条从起点出发、若干检查点组成的路线。"""
+
     start: Platform
-    target: Platform
+    checkpoints: list[Platform]
+    bonus_stars: list[Platform]
     platforms: list[Platform]
+    shortened: bool = False
+
+    @property
+    def goal(self) -> Optional[Platform]:
+        return self.checkpoints[-1] if self.checkpoints else None
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    hearts: int = START_HEARTS
+    checkpoint_count: int = COURSE_CHECKPOINTS
+    star_count: int = BONUS_STAR_COUNT
+    seed: Optional[int] = None
+    relaxed: bool = False
 
 
 @dataclass
@@ -264,12 +304,52 @@ class ScanResult:
 
 @dataclass
 class UpdateEvents:
-    """物理更新向外层汇报的事件。"""
+    """物理/落点更新向外层汇报的事件。"""
 
     landed: Optional[Platform] = None
+    checkpoint: Optional[Platform] = None
+    star: Optional[Platform] = None
+    perfect: bool = False
+    direct: bool = False
+    score_delta: int = 0
+    combo: int = 0
+    checkpoint_index: int = 0
+    hearts_left: Optional[int] = None
     victory: bool = False
     fell: bool = False
     game_over: bool = False
+
+
+@dataclass(frozen=True)
+class RunSnapshot:
+    score: int
+    combo: int
+    combo_multiplier: float
+    hearts: Optional[int]
+    checkpoint_index: int
+    checkpoint_count: int
+    elapsed: float
+    perfect_count: int
+    direct_count: int
+    stars_collected: int
+    stars_total: int
+    jumps: int
+    falls: int
+    state: str
+
+
+@dataclass(frozen=True)
+class RunResult:
+    completed: bool
+    score: int
+    elapsed: float
+    hearts_left: Optional[int]
+    falls: int
+    perfect_count: int
+    direct_count: int
+    stars_collected: int
+    stars_total: int
+    rating: int
 
 
 @dataclass
@@ -502,38 +582,218 @@ def can_directly_reach(start: Platform, target: Platform) -> bool:
     return True
 
 
-def generate_level(platforms: Sequence[Platform], rng: Optional[random.Random] = None) -> Level:
-    """随机目标 + 逐级放宽阈值选起点。"""
-    if len(platforms) < 2:
-        raise LevelError("至少需要 2 个可用控件才能生成关卡。")
+def _checkpoint_pool(platforms: Sequence[Platform], strict: bool = True) -> list[Platform]:
+    """优先选中小控件作为检查点；数量不足时退回全部控件。"""
+    preferred = [
+        p
+        for p in platforms
+        if p.rect.width <= CHECKPOINT_MAX_WIDTH
+        and p.rect.height <= CHECKPOINT_MAX_HEIGHT
+    ]
+    if strict and len(preferred) >= 3:
+        return preferred
+    return list(platforms)
 
-    rng = rng or random.Random()
-    all_platforms = list(platforms)
-    targets = list(all_platforms)
-    rng.shuffle(targets)
 
-    for target in targets[: min(24, len(targets))]:
-        for factor in START_THRESHOLD_FACTORS:
-            threshold = START_DISTANCE_THRESHOLD * factor
-            eligible = [
-                p
-                for p in all_platforms
-                if p.uid != target.uid
-                and abs(p.center_x - target.center_x) >= threshold
-            ]
-            if not eligible:
+def _step_distance_band(step: int) -> tuple[float, float]:
+    low = 110.0 + 80.0 * step
+    high = 520.0 + 120.0 * step
+    return low, min(high, JUMP_DISTANCE_MAX)
+
+
+def _extend_chain(
+    path: list[Platform],
+    pool: Sequence[Platform],
+    target_length: int,
+    used: set[int],
+    rng: random.Random,
+    attempts: list[int],
+) -> bool:
+    if len(path) >= target_length:
+        return True
+    attempts[0] += 1
+    if attempts[0] > COURSE_GENERATION_ATTEMPTS:
+        return False
+    current = path[-1]
+    step = len(path)
+    low, high = _step_distance_band(step)
+    reachable: list[tuple[Platform, float]] = []
+    for candidate in pool:
+        if candidate.uid in used:
+            continue
+        if not can_directly_reach(current, candidate):
+            continue
+        dx = abs(current.center_x - candidate.center_x)
+        reachable.append((candidate, dx))
+    if not reachable:
+        return False
+
+    in_band = [(p, dx) for p, dx in reachable if low <= dx <= high]
+    options = in_band if in_band else reachable
+    rng.shuffle(options)
+    # 限制分支数，避免在大 UI 树上爆炸；随机顺序仍保证路线多样。
+    for candidate, _dx in options[:10]:
+        path.append(candidate)
+        used.add(candidate.uid)
+        if _extend_chain(path, pool, target_length, used, rng, attempts):
+            return True
+        used.remove(candidate.uid)
+        path.pop()
+    return False
+
+
+def _build_chain(
+    platforms: Sequence[Platform],
+    pool: Sequence[Platform],
+    length: int,
+    rng: random.Random,
+    *,
+    start: Optional[Platform] = None,
+    excluded_uids: Optional[set[int]] = None,
+) -> Optional[list[Platform]]:
+    """生成包含起点在内、长度为 length 的可达路线。"""
+    if length < 2:
+        return None
+    excluded = set(excluded_uids or ())
+    if start is not None:
+        starts = [start]
+    else:
+        starts = [p for p in platforms if p.uid not in excluded]
+    rng.shuffle(starts)
+    for candidate_start in starts[:40]:
+        if len(pool) < length:
+            continue
+        path = [candidate_start]
+        used = {candidate_start.uid} | excluded
+        attempts = [0]
+        if _extend_chain(path, pool, length, used, rng, attempts):
+            return path
+    return None
+
+
+def _pick_bonus_stars(
+    platforms: Sequence[Platform],
+    route: Sequence[Platform],
+    count: int,
+    rng: random.Random,
+) -> list[Platform]:
+    if count <= 0:
+        return []
+    used = {p.uid for p in route}
+    candidates = [p for p in platforms if p.uid not in used]
+    if not candidates:
+        return []
+    # 优先选能被路线中某个检查点抓到的星星，减少“完全够不到”的情况。
+    reachable = [
+        p
+        for p in candidates
+        if any(can_directly_reach(checkpoint, p) for checkpoint in route)
+    ]
+    pool = reachable if len(reachable) >= count else candidates
+    rng.shuffle(pool)
+    # 去重 UID（路线所有平台本来就不重复）
+    chosen: list[Platform] = []
+    seen: set[int] = set()
+    for platform in pool:
+        if platform.uid in seen:
+            continue
+        seen.add(platform.uid)
+        chosen.append(platform)
+        if len(chosen) >= count:
+            break
+    return chosen
+
+
+def pick_bonus_stars(
+    platforms: Sequence[Platform],
+    route: Sequence[Platform],
+    count: int,
+    rng: random.Random,
+) -> list[Platform]:
+    """供桌面布局变化后的路线修复使用。"""
+    return _pick_bonus_stars(platforms, route, count, rng)
+
+
+def generate_course(
+    platforms: Sequence[Platform],
+    config: Optional[RunConfig] = None,
+    rng: Optional[random.Random] = None,
+) -> Course:
+    """生成一条保证逐段基本可达的巡回路线。"""
+    config = config or RunConfig()
+    rng = rng or random.Random(config.seed)
+    if len(platforms) < 3:
+        raise LevelError("至少需要 3 个可用控件才能生成巡回赛。")
+
+    requested = max(MIN_CHECKPOINTS, min(MAX_CHECKPOINTS, int(config.checkpoint_count)))
+    # 优先使用中小控件；不够时放宽到全部平台
+    pools = []
+    preferred = _checkpoint_pool(platforms, strict=True)
+    if preferred:
+        pools.append(preferred)
+    if len(preferred) != len(platforms):
+        pools.append(list(platforms))
+
+    # 先尝试最长路线，再逐步缩短；同一长度下优先使用可控的中小控件。
+    for checkpoint_count in range(requested, MIN_CHECKPOINTS - 1, -1):
+        for pool in pools:
+            chain = _build_chain(platforms, pool, checkpoint_count + 1, rng)
+            if chain is None:
                 continue
+            start = chain[0]
+            checkpoints = chain[1:]
+            stars = _pick_bonus_stars(
+                platforms,
+                chain,
+                max(0, min(4, int(config.star_count))),
+                rng,
+            )
+            return Course(
+                start=start,
+                checkpoints=checkpoints,
+                bonus_stars=stars,
+                platforms=list(platforms),
+                shortened=checkpoint_count < requested,
+            )
 
-            # 只保留基本可达的起点，再从中挑水平距离最远的几个。
-            viable = [p for p in eligible if can_directly_reach(p, target)]
-            if not viable:
-                continue
-            viable.sort(key=lambda p: abs(p.center_x - target.center_x), reverse=True)
-            start = rng.choice(viable[:3])
-            return Level(start=start, target=target, platforms=all_platforms)
+    raise LevelError(
+        "当前控件之间无法生成包含至少 2 个检查点的可达路线。"
+        "请换一个控件更多的窗口，或按 D 扫描整个桌面。"
+    )
 
-    raise LevelError("当前候选控件之间距离过远或高度差过大，无法生成可达关卡。")
 
+def generate_remaining_checkpoints(
+    platforms: Sequence[Platform],
+    start: Platform,
+    count: int,
+    rng: random.Random,
+    *,
+    excluded_uids: Optional[set[int]] = None,
+    strict_pool: bool = True,
+) -> list[Platform]:
+    """从当前平台生成剩余检查点，用于桌面布局变化时保留进度。"""
+    count = max(1, int(count))
+    pool = _checkpoint_pool(platforms, strict=strict_pool)
+    chain = _build_chain(
+        platforms,
+        pool,
+        count + 1,
+        rng,
+        start=start,
+        excluded_uids=excluded_uids,
+    )
+    if chain is None and strict_pool:
+        return generate_remaining_checkpoints(
+            platforms,
+            start,
+            count,
+            rng,
+            excluded_uids=excluded_uids,
+            strict_pool=False,
+        )
+    if chain is None:
+        raise LevelError("桌面布局变化后无法从当前位置生成剩余路线。")
+    return chain[1:]
 
 def find_landing(
     prev_x: float,
@@ -577,20 +837,17 @@ def find_landing(
 
 
 class GameModel:
-    """与 Tk/Windows 无关的游戏逻辑，便于单元测试。"""
+    """与 Tk/Windows/macOS 无关的巡回赛逻辑，便于单元测试。"""
 
     def __init__(
         self,
-        level: Level,
+        course: Course,
         screen: Rect,
-        *,
-        limit_retries: bool = LIMIT_RETRIES,
-        max_retries: int = MAX_RETRIES,
+        config: Optional[RunConfig] = None,
     ) -> None:
-        self.level = level
+        self.course = course
         self.screen = screen
-        self.limit_retries = limit_retries
-        self.max_retries = max_retries
+        self.config = config or RunConfig()
         self.state = STATE_READY
         self.direction = 1
         self.power = 0.0
@@ -599,53 +856,170 @@ class GameModel:
         self.char_feet = 0.0
         self.vx = 0.0
         self.vy = 0.0
-        self.current = level.start
+        self.current = course.start
+        self.respawn_platform = course.start
         self.jumps = 0
         self.falls = 0
         self.flight_time = 0.0
         self.missed = False
+        self.checkpoint_index = 0
+        self.score = 0
+        self.combo = 0
+        self.perfect_count = 0
+        self.direct_count = 0
+        self.hearts = max(1, int(self.config.hearts))
+        self.relaxed = bool(self.config.relaxed)
+        self.collected_star_uids: set[int] = set()
+        self.elapsed = 0.0
+        self.timer_started = False
+        self.intermediate_since_checkpoint = False
+        self._result: Optional[RunResult] = None
         self._reset_position()
 
     # -- 查询 -----------------------------------------------------------------
 
     @property
-    def remaining_retries(self) -> Optional[int]:
-        if not self.limit_retries:
+    def hearts_left(self) -> Optional[int]:
+        if self.relaxed:
             return None
-        return max(0, self.max_retries - self.falls)
+        return max(0, self.hearts)
+
+    @property
+    def next_target(self) -> Optional[Platform]:
+        if 0 <= self.checkpoint_index < len(self.course.checkpoints):
+            return self.course.checkpoints[self.checkpoint_index]
+        return None
+
+    @property
+    def goal(self) -> Optional[Platform]:
+        return self.course.goal
+
+    @property
+    def combo_multiplier(self) -> float:
+        if self.combo <= 0:
+            return 1.0
+        return min(
+            MAX_COMBO_MULTIPLIER,
+            1.0 + COMBO_MULTIPLIER_STEP * (self.combo - 1),
+        )
+
+    @property
+    def rating(self) -> int:
+        if self._result is not None:
+            return self._result.rating
+        return 0
+
+    @property
+    def result(self) -> Optional[RunResult]:
+        return self._result
+
+    @property
+    def stars_total(self) -> int:
+        return len(self.course.bonus_stars)
+
+    @property
+    def stars_collected(self) -> int:
+        return len(self.collected_star_uids)
 
     @property
     def is_charging(self) -> bool:
         return self.state == STATE_CHARGING
 
+    def snapshot(self) -> RunSnapshot:
+        return RunSnapshot(
+            score=self.score,
+            combo=self.combo,
+            combo_multiplier=self.combo_multiplier,
+            hearts=self.hearts_left,
+            checkpoint_index=self.checkpoint_index,
+            checkpoint_count=len(self.course.checkpoints),
+            elapsed=self.elapsed,
+            perfect_count=self.perfect_count,
+            direct_count=self.direct_count,
+            stars_collected=self.stars_collected,
+            stars_total=self.stars_total,
+            jumps=self.jumps,
+            falls=self.falls,
+            state=self.state,
+        )
+
     # -- 关卡/位置 -------------------------------------------------------------
 
     def _default_direction(self) -> int:
-        return 1 if self.level.target.center_x >= self.level.start.center_x else -1
+        target = self.next_target or self.course.goal or self.course.start
+        return 1 if target.center_x >= self.current.center_x else -1
 
     def _reset_position(self) -> None:
-        self.current = self.level.start
-        self.char_x = self.level.start.rect.center_x
-        self.char_feet = float(self.level.start.rect.top)
+        self.current = self.respawn_platform
+        self.char_x = self.respawn_platform.rect.center_x
+        self.char_feet = float(self.respawn_platform.rect.top)
         self.vx = 0.0
         self.vy = 0.0
         self.power = 0.0
         self.flight_time = 0.0
         self.missed = False
+        self.intermediate_since_checkpoint = False
         self.direction = self._default_direction()
         self.state = STATE_READY
 
-    def load_level(self, level: Level, *, preserve_stats: bool = True) -> None:
-        old_jumps = self.jumps
-        old_falls = self.falls
-        self.level = level
-        if preserve_stats:
-            self.jumps = old_jumps
-            self.falls = old_falls
-        else:
-            self.jumps = 0
-            self.falls = 0
+    def load_course(self, course: Course) -> None:
+        """为同一 GameModel 装入新的一局，重置所有成绩。"""
+        self.course = course
+        self.current = course.start
+        self.respawn_platform = course.start
+        self.checkpoint_index = 0
+        self.score = 0
+        self.combo = 0
+        self.perfect_count = 0
+        self.direct_count = 0
+        self.hearts = max(1, int(self.config.hearts))
+        self.collected_star_uids.clear()
+        self.elapsed = 0.0
+        self.timer_started = False
+        self.jumps = 0
+        self.falls = 0
+        self.flight_time = 0.0
+        self.missed = False
+        self._result = None
         self._reset_position()
+
+    def replace_pending_checkpoints(
+        self,
+        platforms: Sequence[Platform],
+        checkpoints: Sequence[Platform],
+        bonus_stars: Sequence[Platform],
+        *,
+        current_platform: Optional[Platform] = None,
+        respawn_platform: Optional[Platform] = None,
+    ) -> None:
+        """桌面变化时替换未访问路线，保留已取得成绩和心数。
+
+        已完成检查点保留在 prefix 中；若 UI 找到了当前/复活平台的新元素，
+        可以一起替换，避免继续引用已失效的旧 UIA/AX 元素。
+        """
+        if not checkpoints:
+            raise LevelError("桌面布局变化后没有可用的剩余检查点。")
+        if current_platform is not None:
+            self.current = current_platform
+            if self.state == STATE_READY:
+                self.char_x = current_platform.rect.center_x
+                self.char_feet = float(current_platform.rect.top)
+        if respawn_platform is not None:
+            self.respawn_platform = respawn_platform
+        prefix = list(self.course.checkpoints[: self.checkpoint_index])
+        self.course.platforms = list(platforms)
+        self.course.checkpoints = prefix + list(checkpoints)
+        self.course.bonus_stars = list(bonus_stars)
+        if self.checkpoint_index > 0 and respawn_platform is None:
+            self.respawn_platform = self.course.checkpoints[self.checkpoint_index - 1]
+        elif self.checkpoint_index == 0 and respawn_platform is None:
+            self.respawn_platform = self.course.start
+        self.collected_star_uids &= {p.uid for p in bonus_stars}
+        self.intermediate_since_checkpoint = True
+        # 若当前站在平台上，只调整面向，不突然传送。
+        target = self.next_target
+        if target is not None:
+            self.direction = 1 if target.center_x >= self.current.center_x else -1
 
     # -- 输入 -----------------------------------------------------------------
 
@@ -679,14 +1053,22 @@ class GameModel:
         self.vx, self.vy = initial_velocity(self.power, self.direction)
         self.state = STATE_AIRBORNE
         self.jumps += 1
+        self.timer_started = True
         self.flight_time = 0.0
         self.missed = False
         return True
 
+    def advance_clock(self, dt: float) -> None:
+        """由 UI 每帧调用；失焦时 UI 不调用，因此暂停计时。"""
+        if not self.timer_started:
+            return
+        if self.state in (STATE_READY, STATE_CHARGING, STATE_AIRBORNE):
+            self.elapsed += clamp(float(dt), 0.0, MAX_DT)
+
     # -- 物理 -----------------------------------------------------------------
 
     def tick(self, dt: float) -> UpdateEvents:
-        events = UpdateEvents()
+        events = UpdateEvents(hearts_left=self.hearts_left)
         if self.state != STATE_AIRBORNE:
             return events
 
@@ -694,7 +1076,6 @@ class GameModel:
         if dt <= 0:
             return events
 
-        # 根据最大速度决定子步数量，避免高速穿过细控件。
         speed = max(abs(self.vx), abs(self.vy) + GRAVITY * dt)
         displacement = speed * dt
         steps = max(1, min(32, int(math.ceil(displacement / MAX_SUBSTEP_PX))))
@@ -715,14 +1096,10 @@ class GameModel:
                     prev_feet,
                     self.char_x,
                     self.char_feet,
-                    self.level.platforms,
+                    self.course.platforms,
                 )
                 if landing is not None:
-                    self._land_on(landing)
-                    events.landed = landing.platform
-                    if self.state == STATE_VICTORY:
-                        events.victory = True
-                    return events
+                    return self._land_on(landing)
 
                 if (
                     self.char_x < -FALL_MARGIN
@@ -734,13 +1111,13 @@ class GameModel:
                 self.char_feet > self.screen.bottom + FALL_MARGIN
                 or self.flight_time > MAX_FLIGHT_SECONDS
             ):
-                events.fell = True
-                events.game_over = self._finish_fall()
-                return events
+                return self._finish_fall()
 
         return events
 
-    def _land_on(self, landing: Landing) -> None:
+    # -- 落点与检查点 -----------------------------------------------------------
+
+    def _land_on(self, landing: Landing) -> UpdateEvents:
         platform = landing.platform
         rect = platform.rect
         margin = CHAR_COLLISION_WIDTH / 2.0 + 2.0
@@ -757,30 +1134,136 @@ class GameModel:
         self.flight_time = 0.0
         self.missed = False
         self.current = platform
-        if platform.uid == self.level.target.uid:
-            self.state = STATE_VICTORY
-        else:
-            self.state = STATE_READY
+        self.state = STATE_READY
 
-    def _finish_fall(self) -> bool:
-        """完成一次坠落。返回是否进入 game over。"""
+        events = UpdateEvents(
+            landed=platform,
+            combo=self.combo,
+            checkpoint_index=self.checkpoint_index,
+            hearts_left=self.hearts_left,
+        )
+        target = self.next_target
+        if target is not None and platform.uid == target.uid:
+            old_index = self.checkpoint_index
+            self.checkpoint_index += 1
+            self.combo += 1
+            perfect = abs(x - rect.center_x) <= rect.width * PERFECT_CENTER_RATIO
+            direct = not self.intermediate_since_checkpoint
+            multiplier = self.combo_multiplier
+            raw_points = (
+                CHECKPOINT_BASE_SCORE
+                + CHECKPOINT_SCORE_STEP * old_index
+                + (PERFECT_BONUS if perfect else 0)
+                + (DIRECT_BONUS if direct else 0)
+            )
+            points = int(round(raw_points * multiplier))
+            self.score += points
+            if perfect:
+                self.perfect_count += 1
+            if direct:
+                self.direct_count += 1
+            self.respawn_platform = platform
+            self.intermediate_since_checkpoint = False
+
+            events.checkpoint = platform
+            events.perfect = perfect
+            events.direct = direct
+            events.score_delta += points
+            events.combo = self.combo
+            events.checkpoint_index = self.checkpoint_index
+            events.hearts_left = self.hearts_left
+
+            if self.checkpoint_index >= len(self.course.checkpoints):
+                finish_bonus = self._finalize_victory()
+                events.score_delta += finish_bonus
+                events.victory = True
+            return events
+
+        # 非当前检查点：可选星星拿分，否则只是普通落脚点。
+        if any(star.uid == platform.uid for star in self.course.bonus_stars):
+            if platform.uid not in self.collected_star_uids:
+                self.collected_star_uids.add(platform.uid)
+                self.score += STAR_BONUS
+                events.star = platform
+                events.score_delta += STAR_BONUS
+        self.intermediate_since_checkpoint = True
+        events.combo = self.combo
+        events.checkpoint_index = self.checkpoint_index
+        events.hearts_left = self.hearts_left
+        return events
+
+    def _make_result(self, completed: bool) -> RunResult:
+        if completed:
+            rating = 3 if self.falls == 0 else (2 if self.falls <= 1 else 1)
+        else:
+            rating = 0
+        return RunResult(
+            completed=completed,
+            score=self.score,
+            elapsed=self.elapsed,
+            hearts_left=self.hearts_left,
+            falls=self.falls,
+            perfect_count=self.perfect_count,
+            direct_count=self.direct_count,
+            stars_collected=self.stars_collected,
+            stars_total=self.stars_total,
+            rating=rating,
+        )
+
+    def _finalize_victory(self) -> int:
+        if self._result is not None:
+            return 0
+        hearts_bonus = 0 if self.relaxed else max(0, self.hearts) * FINISH_HEART_BONUS
+        time_bonus = max(
+            0,
+            FINISH_TIME_BONUS_BASE - int(self.elapsed * FINISH_TIME_BONUS_RATE),
+        )
+        finish_bonus = hearts_bonus + time_bonus
+        self.score += finish_bonus
+        self.state = STATE_VICTORY
+        self._result = self._make_result(True)
+        return finish_bonus
+
+    def _finish_fall(self) -> UpdateEvents:
         self.falls += 1
+        self.combo = 0
+        self.intermediate_since_checkpoint = False
         self.vx = 0.0
         self.vy = 0.0
         self.power = 0.0
-        if self.limit_retries and self.falls >= self.max_retries:
-            self.state = STATE_GAME_OVER
-            return True
-        self._reset_position()
-        return False
+        if not self.relaxed:
+            self.hearts = max(0, self.hearts - 1)
 
-    def force_land_for_test(self, platform: Platform, x: Optional[float] = None) -> None:
+        events = UpdateEvents(
+            fell=True,
+            combo=0,
+            checkpoint_index=self.checkpoint_index,
+            hearts_left=self.hearts_left,
+        )
+        if not self.relaxed and self.hearts <= 0:
+            self.state = STATE_GAME_OVER
+            self._result = self._make_result(False)
+            events.game_over = True
+            return events
+
+        self._reset_position()
+        return events
+
+    def reset_to_respawn(self) -> None:
+        """无惩罚回到最近检查点，用于布局刷新等非坠落场景。"""
+        self.cancel_charge()
+        self._reset_position()
+
+    def force_land_for_test(
+        self, platform: Platform, x: Optional[float] = None
+    ) -> UpdateEvents:
         """测试辅助：直接完成一次落点判定，不参与正式流程。"""
         px = self.char_x if x is None else x
-        self._land_on(Landing(platform=platform, x=px, top=platform.rect.top, t=0.0))
+        return self._land_on(
+            Landing(platform=platform, x=px, top=platform.rect.top, t=0.0)
+        )
 
-
-def startup_countdown(seconds: float, message: str = "Dango Jump：请切换到要游玩的窗口。") -> None:
+def startup_countdown(seconds: float, message: str = "Dango Circuit：请切换到要游玩的窗口。") -> None:
     """终端倒计时；给用户时间切换到目标窗口。"""
     if seconds <= 0:
         return

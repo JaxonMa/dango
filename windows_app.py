@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Dango Jump — Windows 10/11 backend (Tk + UI Automation)."""
+"""Dango Circuit — Windows 10/11 backend (Tk + UI Automation)."""
 
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ from dango_core import (
     COL_PANEL,
     COL_PANEL_2,
     COL_RED,
+    COL_STAR,
     COL_TEXT,
     FONT_BODY,
     FONT_BODY_BOLD,
@@ -38,20 +39,23 @@ from dango_core import (
     FPS_MS,
     GRAVITY,
     GameModel,
-    LIMIT_RETRIES,
     LevelError,
     MAX_DT,
-    MAX_RETRIES,
+    MIN_CONTROL_SIZE,
     MONITOR_INTERVAL_MS,
     Particle,
     Platform,
     RawControl,
     Rect,
+    RunConfig,
+    RunResult,
     SCAN_MAX_DEPTH,
     SCAN_MAX_NODES,
     SCAN_TIMEOUT_SECONDS,
     STATE_AIRBORNE,
     STATE_CHARGING,
+    STATE_READY,
+    STAR_BONUS,
     ScanError,
     ScanResult,
     TARGET_MOVE_TOLERANCE,
@@ -59,8 +63,10 @@ from dango_core import (
     UpdateEvents,
     clamp,
     filter_platforms,
-    generate_level,
+    generate_course,
+    generate_remaining_checkpoints,
     jump_distance,
+    pick_bonus_stars,
     platform_display_name,
     point_in_rect,
     rects_differ,
@@ -68,6 +74,13 @@ from dango_core import (
     startup_countdown,
     trajectory_points,
     truncate_text,
+)
+from dango_audio import SoundPlayer
+from dango_progress import (
+    Progress,
+    load_progress,
+    record_result,
+    save_progress,
 )
 
 
@@ -110,7 +123,7 @@ def enable_dpi_awareness() -> None:
 
 def primary_screen_rect() -> Rect:
     if sys.platform != "win32":
-        raise RuntimeError("Dango Jump 仅支持 Windows。")
+        raise RuntimeError("Dango Circuit 仅支持 Windows。")
     import ctypes
 
     user32 = ctypes.windll.user32
@@ -138,7 +151,7 @@ def get_window_title(hwnd: int) -> str:
 
 def get_foreground_window_info() -> tuple[int, str]:
     if sys.platform != "win32":
-        raise RuntimeError("Dango Jump 仅支持 Windows。")
+        raise RuntimeError("Dango Circuit 仅支持 Windows。")
     import ctypes
 
     hwnd = int(ctypes.windll.user32.GetForegroundWindow())
@@ -227,7 +240,7 @@ def scan_controls(
     scope: "window" 或 "desktop"。
     """
     if sys.platform != "win32":
-        raise ScanError("Dango Jump 仅支持 Windows。", kind="platform")
+        raise ScanError("Dango Circuit 仅支持 Windows。", kind="platform")
 
     try:
         import uiautomation as auto
@@ -327,20 +340,60 @@ def scan_controls(
     )
 
 
-def platform_is_live(platform: Platform, tolerance: int = TARGET_MOVE_TOLERANCE) -> bool:
-    """查询 UIA 判断控件是否仍存在、可见且没有移动。"""
+def read_platform_rect(platform: Platform) -> Optional[Rect]:
+    """读取 UIA 控件实时矩形；不存在/离屏/异常时返回 None。"""
     element = platform.element
     if element is None:
-        return True
+        return platform.source_rect
     try:
         if bool(_safe_attr(element, "IsOffscreen", False)):
-            return False
-        live = _uia_rect(_safe_attr(element, "BoundingRectangle", None))
-        if live is None:
-            return False
-        return not rects_differ(platform.source_rect, live, tolerance)
+            return None
+        return _uia_rect(_safe_attr(element, "BoundingRectangle", None))
     except Exception:
+        return None
+
+
+def update_platform_from_rect(platform: Platform, live: Rect, screen: Rect) -> bool:
+    if live is None:
         return False
+    clipped = live.intersect(screen)
+    if clipped is None or clipped.width < MIN_CONTROL_SIZE or clipped.height < MIN_CONTROL_SIZE:
+        return False
+    platform.source_rect = live
+    platform.rect = clipped
+    return True
+
+
+def platform_is_live(platform: Platform, tolerance: int = TARGET_MOVE_TOLERANCE) -> bool:
+    """查询 UIA 判断控件是否仍存在、可见且没有移动。"""
+    live = read_platform_rect(platform)
+    if live is None:
+        return False
+    return not rects_differ(platform.source_rect, live, tolerance)
+
+
+def match_platform(old: Platform, platforms: Sequence[Platform]) -> Optional[Platform]:
+    """重新扫描后，按名称/类型和位置找回旧控件的新元素。"""
+    same = [
+        p
+        for p in platforms
+        if p.name == old.name and p.control_type == old.control_type
+    ]
+    pool = same or list(platforms)
+    if not pool:
+        return None
+    candidate = min(
+        pool,
+        key=lambda p: abs(p.rect.center_x - old.rect.center_x)
+        + abs(p.rect.center_y - old.rect.center_y),
+    )
+    if not same:
+        distance = abs(candidate.rect.center_x - old.rect.center_x) + abs(
+            candidate.rect.center_y - old.rect.center_y
+        )
+        if distance > 180:
+            return None
+    return candidate
 
 
 # =============================================================================
@@ -358,8 +411,8 @@ class OverlayApp:
         hwnd: int,
         window_title: str,
         *,
-        limit_retries: bool = LIMIT_RETRIES,
-        max_retries: int = MAX_RETRIES,
+        run_config: Optional[RunConfig] = None,
+        muted: bool = False,
     ) -> None:
         import tkinter as tk
 
@@ -368,8 +421,18 @@ class OverlayApp:
         self.scope = scope
         self.hwnd = hwnd
         self.window_title = window_title or "未命名窗口"
-        self.limit_retries = limit_retries
-        self.max_retries = max_retries
+        self.run_config = run_config or RunConfig()
+        self.progress: Progress = load_progress()
+        if muted:
+            self.progress.muted = True
+            save_progress(self.progress)
+        self.sound = SoundPlayer(muted=self.progress.muted)
+        self._best_score = self.progress.best_score
+        self._new_best = False
+        self._run_result: Optional[RunResult] = None
+        self._popups: list[dict[str, Any]] = []
+        self._squash = 0.0
+        self._repairing = False
 
         self.root = tk.Tk()
         self.root.withdraw()
@@ -426,6 +489,9 @@ class OverlayApp:
         self._release_job: Optional[str] = None
         self._focus_check_job: Optional[str] = None
         self._last_scan: Optional[ScanResult] = None
+        self._hud_progress_id: Optional[int] = None
+        self._hud_combo_id: Optional[int] = None
+        self._muted_id: Optional[int] = None
 
         self._build_sprites()
         self._bind_events()
@@ -576,6 +642,7 @@ class OverlayApp:
                     self.root.after_cancel(job)
                 except Exception:
                     pass
+        save_progress(self.progress)
         previous = self.hwnd
         try:
             self.root.destroy()
@@ -592,6 +659,12 @@ class OverlayApp:
         keysym = str(getattr(event, "keysym", ""))
         if keysym == "Escape":
             self._quit()
+            return "break"
+        if keysym.lower() == "m":
+            self.progress.muted = not self.progress.muted
+            self.sound.set_muted(self.progress.muted)
+            save_progress(self.progress)
+            self.show_toast("音效已静音" if self.progress.muted else "音效已开启", 1.2)
             return "break"
 
         if self.mode == "error":
@@ -738,7 +811,7 @@ class OverlayApp:
                 self.screen,
                 own_pid=os.getpid(),
             )
-            level = generate_level(result.platforms)
+            course = generate_course(result.platforms, self.run_config)
         except (ScanError, LevelError) as exc:
             self.scanning = False
             self._last_scan = None
@@ -751,22 +824,20 @@ class OverlayApp:
             return
 
         self._last_scan = result
-        preserve = (not reset_stats) and self.model is not None
-        if preserve:
-            self.model.load_level(level, preserve_stats=True)
-        else:
-            self.model = GameModel(
-                level,
-                self.screen,
-                limit_retries=self.limit_retries,
-                max_retries=self.max_retries,
-            )
-
+        self._run_result = None
+        self._new_best = False
+        self.model = GameModel(course, self.screen, self.run_config)
         self.scanning = False
         self.mode = "playing"
         self._particles.clear()
+        self._popups.clear()
         self._space_down = False
         self._build_scene()
+        if course.shortened:
+            self.show_toast(
+                f"可用控件不足，路线缩短为 {len(course.checkpoints)} 站。",
+                2.2,
+            )
         self._grab_focus()
         self._schedule_monitor()
 
@@ -786,24 +857,98 @@ class OverlayApp:
             if self.mode == "playing":
                 self._schedule_monitor()
             return
-
-        # 失焦时保持暂停，避免用户切到别的窗口后游戏又强行抢回焦点。
-        if self.focus_lost:
+        if self.focus_lost or self._repairing:
             self._schedule_monitor()
             return
 
-        target = self.model.level.target
-        current = self.model.current
-        target_ok = platform_is_live(target)
-        current_ok = current.uid == target.uid or platform_is_live(current)
+        model = self.model
+        missing: set[int] = set()
+        for platform in model.course.platforms:
+            live = read_platform_rect(platform)
+            if live is None:
+                missing.add(platform.uid)
+            else:
+                update_platform_from_rect(platform, live, self.screen)
 
-        if not target_ok or not current_ok:
-            self._begin_scan(
-                reset_stats=False,
-                reason="控件已消失或移动，正在重新生成关卡…",
-            )
+        if model.state == STATE_READY:
+            model.char_x = model.current.rect.center_x
+            model.char_feet = float(model.current.rect.top)
+
+        target = model.next_target
+        current = model.current
+        route_missing = bool(
+            (target is not None and target.uid in missing)
+            or (current is not None and current.uid in missing)
+            or any(cp.uid in missing for cp in model.course.checkpoints[model.checkpoint_index:])
+        )
+        if route_missing:
+            self._repair_route()
             return
 
+        self._refresh_hud()
+        self._draw_markers()
+        self._schedule_monitor()
+
+    def _repair_route(self) -> None:
+        """重新扫描桌面，替换未访问路线，保留分数、心数和检查点进度。"""
+        if self._repairing or self.model is None:
+            return
+        self._repairing = True
+        self.show_toast("桌面布局已变化，正在更新剩余路线…", 2.0)
+        try:
+            result = scan_controls(
+                self.scope,
+                self.hwnd,
+                self.screen,
+                own_pid=os.getpid(),
+            )
+            platforms = result.platforms
+            old = self.model
+            old_current = old.current
+            old_respawn = old.respawn_platform
+            new_current = match_platform(old_current, platforms)
+            new_respawn = match_platform(old_respawn, platforms)
+            start = new_current or new_respawn
+            if start is None:
+                raise LevelError("桌面布局变化过大，无法定位当前平台。")
+            remaining = max(1, len(old.course.checkpoints) - old.checkpoint_index)
+            rng = random.Random(self.run_config.seed)
+            new_checkpoints = generate_remaining_checkpoints(
+                platforms,
+                start,
+                remaining,
+                rng,
+                excluded_uids={p.uid for p in old.course.checkpoints[: old.checkpoint_index]},
+            )
+            route_for_stars = [start] + new_checkpoints
+            new_stars = pick_bonus_stars(
+                platforms,
+                route_for_stars,
+                max(0, int(self.run_config.star_count)),
+                rng,
+            )
+            if old.state != STATE_READY:
+                old.reset_to_respawn()
+            old.replace_pending_checkpoints(
+                platforms,
+                new_checkpoints,
+                new_stars,
+                current_platform=new_current or new_respawn,
+                respawn_platform=new_respawn or new_current,
+            )
+            self._draw_candidate_outlines()
+            self._draw_markers()
+            self._refresh_hud()
+            self.show_toast("路线已更新，进度保留。", 2.0)
+        except (ScanError, LevelError) as exc:
+            self._show_error_card(str(exc))
+            return
+        except Exception as exc:
+            traceback.print_exc()
+            self._show_error_card(f"更新路线失败：{exc}")
+            return
+        finally:
+            self._repairing = False
         self._schedule_monitor()
 
     # =========================================================================
@@ -820,16 +965,17 @@ class OverlayApp:
         try:
             if self.mode == "playing" and self.model is not None:
                 if not self.focus_lost:
+                    self.model.advance_clock(dt)
                     if self.model.state == STATE_CHARGING:
                         self.model.update_charge(now)
                     elif self.model.state == STATE_AIRBORNE:
                         events = self.model.tick(dt)
                         self._handle_events(events)
                 self._update_particles(dt)
+                self._update_popups(dt)
+                self._squash = max(0.0, self._squash - dt)
                 self._pulse_target(now)
                 self._draw_dynamic(now)
-            elif self.mode == "victory" and now > self._toast_until:
-                pass
         except Exception:
             traceback.print_exc()
             self._show_error_card("游戏运行发生异常，请按 R 重试。")
@@ -838,15 +984,50 @@ class OverlayApp:
             self._tick_job = self.root.after(FPS_MS, self._tick)
 
     def _handle_events(self, events: UpdateEvents) -> None:
+        model = self.model
+        if model is None:
+            return
         if events.landed is not None:
             self._spawn_particles(
-                self.model.char_x,
-                self.model.char_feet,
+                model.char_x,
+                model.char_feet,
                 9,
                 COL_AQUA_SOFT,
             )
-            self._refresh_hud()
+            self._squash = 0.14
+            self.sound.play("land")
             self._draw_markers()
+
+        if events.star is not None:
+            self.sound.play("star")
+            self._spawn_popup(
+                events.star.rect.center_x,
+                events.star.rect.top - 40,
+                f"★ +{STAR_BONUS}",
+                COL_STAR,
+            )
+        if events.checkpoint is not None:
+            if events.perfect:
+                self.sound.play("perfect")
+            else:
+                self.sound.play("checkpoint")
+            bits = [f"+{events.score_delta}"]
+            if events.perfect:
+                bits.append("PERFECT")
+            if events.direct:
+                bits.append("DIRECT")
+            if events.combo > 1:
+                bits.append(f"COMBO x{events.combo}")
+            self._spawn_popup(
+                events.checkpoint.rect.center_x,
+                events.checkpoint.rect.top - 58,
+                "  ".join(bits),
+                COL_AMBER if events.perfect else COL_AQUA_SOFT,
+            )
+            self._draw_markers()
+            self._refresh_hud()
+        elif events.star is not None:
+            self._refresh_hud()
 
         if events.victory:
             self._enter_victory()
@@ -857,28 +1038,100 @@ class OverlayApp:
             return
 
         if events.fell:
-            self.show_toast(
-                "坠落！已回到起点。" if not self.model.limit_retries else "坠落！损失一次机会。",
-                1.8,
-            )
+            self.sound.play("fall")
+            if model.hearts_left is None:
+                message = "坠落！练习模式无限心，已回到检查点。"
+            elif model.hearts_left > 0:
+                message = f"坠落！损失一颗心，剩余 {model.hearts_left} 颗。"
+            else:
+                message = "坠落！心数耗尽。"
+            self.show_toast(message, 1.9)
             self._refresh_hud()
             self._draw_markers()
 
     def _enter_victory(self) -> None:
+        self._finish_run(completed=True)
         self.mode = "victory"
         self._space_down = False
-        self._draw_victory_card()
-        self._release_job = self.root.after(320, self._release_keyboard_focus)
+        self._draw_result_card()
 
     def _enter_game_over(self) -> None:
+        self._finish_run(completed=False)
         self.mode = "game_over"
         self._space_down = False
-        self._draw_game_over_card()
+        self._draw_result_card()
+
+    def _finish_run(self, completed: bool) -> None:
+        if self._run_result is not None or self.model is None:
+            return
+        result = self.model.result
+        if result is None:
+            return
+        self._run_result = result
+        self._new_best = result.score > self._best_score
+        updated, new_best = record_result(
+            self.progress,
+            score=result.score,
+            elapsed=result.elapsed,
+            stars=result.rating,
+            completed=result.completed,
+        )
+        self.progress = updated
+        save_progress(updated)
+        self._best_score = updated.best_score
+        self._new_best = new_best
+        self.sound.play("victory" if completed else "game_over")
         self._release_job = self.root.after(320, self._release_keyboard_focus)
 
     def show_toast(self, text: str, seconds: float = 1.8) -> None:
         self._toast_text = text
         self._toast_until = time.perf_counter() + seconds
+
+    def _spawn_popup(self, x: float, y: float, text: str, color: str) -> None:
+        self._popups.append(
+            {
+                "x": x,
+                "y": y,
+                "text": text,
+                "color": color,
+                "life": 1.25,
+                "max_life": 1.25,
+            }
+        )
+
+    def _update_popups(self, dt: float) -> None:
+        alive = []
+        for popup in self._popups:
+            popup["life"] -= dt
+            popup["y"] -= 28.0 * dt
+            if popup["life"] > 0:
+                alive.append(popup)
+        self._popups = alive
+
+    def _draw_popups(self) -> None:
+        for popup in self._popups:
+            ratio = max(0.0, float(popup["life"]) / float(popup["max_life"]))
+            color = popup["color"] if ratio > 0.35 else COL_MUTED
+            text = str(popup["text"])
+            width = max(60, len(text) * 9 + 24)
+            self._pill(
+                popup["x"] - width / 2,
+                popup["y"] - 13,
+                popup["x"] + width / 2,
+                popup["y"] + 13,
+                COL_PANEL_2,
+                color,
+                8,
+                tags=("dynamic",),
+            )
+            self.canvas.create_text(
+                popup["x"],
+                popup["y"],
+                text=text,
+                fill=color,
+                font=FONT_SMALL_BOLD,
+                tags=("dynamic",),
+            )
 
     def _spawn_particles(self, x: float, y: float, count: int, color: str) -> None:
         rng = random.Random()
@@ -1036,7 +1289,8 @@ class OverlayApp:
     def _draw_candidate_outlines(self) -> None:
         if self.model is None:
             return
-        for platform in self.model.level.platforms:
+        self.canvas.delete("candidate")
+        for platform in self.model.course.platforms:
             r = platform.rect
             self.canvas.create_rectangle(
                 r.left,
@@ -1049,19 +1303,56 @@ class OverlayApp:
                 tags=("candidate",),
             )
 
+    def _draw_badge(
+        self,
+        x: float,
+        y: float,
+        text: str,
+        fill: str,
+        outline: str,
+        text_color: str,
+        width: int = 28,
+    ) -> None:
+        self._pill(
+            x,
+            y - 9,
+            x + width,
+            y + 9,
+            fill,
+            outline,
+            7,
+            tags=("markers",),
+        )
+        self.canvas.create_text(
+            x + width / 2,
+            y,
+            text=text,
+            fill=text_color,
+            font=FONT_SMALL_BOLD,
+            tags=("markers",),
+        )
+
     def _draw_markers(self) -> None:
         if self.model is None:
             return
         self.canvas.delete("markers")
         self._target_outline_ids = []
-        level = self.model.level
+        course = self.model.course
 
-        # 起点：从平台左上角伸出的短标记 + 文本
-        start = level.start.rect
+        # 起点
+        start = course.start.rect
         sx = max(8, start.left + 4)
         sy = max(28, start.top - 24)
-        self._pill(sx - 2, sy - 13, sx + 50, sy + 13, COL_PANEL, COL_AQUA_DIM, 8,
-                   tags=("markers",))
+        self._pill(
+            sx - 2,
+            sy - 13,
+            sx + 50,
+            sy + 13,
+            COL_PANEL,
+            COL_AQUA_DIM,
+            8,
+            tags=("markers",),
+        )
         self.canvas.create_text(
             sx + 24,
             sy,
@@ -1083,6 +1374,110 @@ class OverlayApp:
             tags=("markers",),
         )
 
+        # 已完成的检查点
+        for index, checkpoint in enumerate(course.checkpoints[: self.model.checkpoint_index]):
+            r = checkpoint.rect
+            self.canvas.create_rectangle(
+                r.left,
+                r.top,
+                r.right,
+                r.bottom,
+                outline=COL_GREEN,
+                width=2,
+                tags=("markers",),
+            )
+            self._draw_badge(
+                r.left + 4,
+                max(20, r.top - 16),
+                "✓",
+                COL_PANEL,
+                COL_GREEN,
+                COL_GREEN,
+            )
+
+        # 未到达的未来检查点
+        for index in range(self.model.checkpoint_index + 1, len(course.checkpoints)):
+            checkpoint = course.checkpoints[index]
+            r = checkpoint.rect
+            is_goal = index == len(course.checkpoints) - 1
+            self.canvas.create_rectangle(
+                r.left,
+                r.top,
+                r.right,
+                r.bottom,
+                outline=COL_MUTED,
+                width=1,
+                dash=(3, 5),
+                tags=("markers",),
+            )
+            self._draw_badge(
+                r.left + 4,
+                max(20, r.top - 16),
+                "GOAL" if is_goal else str(index + 1),
+                COL_PANEL,
+                COL_AMBER if is_goal else COL_LINE,
+                COL_AMBER if is_goal else COL_MUTED,
+                width=42 if is_goal else 24,
+            )
+
+        # 当前站：双层闪烁虚线 + 标签
+        target = self.model.next_target
+        if target is not None:
+            tr = target.rect
+            self._target_outline_ids.append(
+                self.canvas.create_rectangle(
+                    tr.left - 3,
+                    tr.top - 3,
+                    tr.right + 3,
+                    tr.bottom + 3,
+                    outline=COL_AMBER,
+                    width=3,
+                    dash=(8, 5),
+                    tags=("markers", "target_outline"),
+                )
+            )
+            self._target_outline_ids.append(
+                self.canvas.create_rectangle(
+                    tr.left + 2,
+                    tr.top + 2,
+                    tr.right - 2,
+                    tr.bottom - 2,
+                    outline=COL_AMBER_SOFT,
+                    width=1,
+                    dash=(3, 7),
+                    tags=("markers", "target_outline"),
+                )
+            )
+            label_text = (
+                f"下一站 {self.model.checkpoint_index + 1}/"
+                f"{len(course.checkpoints)} · {platform_display_name(target)}"
+            )
+            label_w = min(380, max(170, len(label_text) * 13 + 28))
+            lx = clamp(
+                tr.center_x,
+                12 + label_w / 2,
+                self.screen.right - 12 - label_w / 2,
+            )
+            ly = tr.top - 26 if tr.top > 80 else tr.bottom + 26
+            self._pill(
+                lx - label_w / 2,
+                ly - 15,
+                lx + label_w / 2,
+                ly + 15,
+                COL_PANEL,
+                COL_AMBER,
+                9,
+                tags=("markers",),
+            )
+            self.canvas.create_text(
+                lx,
+                ly,
+                text=truncate_text(label_text, 32),
+                fill=COL_AMBER_SOFT,
+                font=FONT_SMALL_BOLD,
+                tags=("markers",),
+            )
+
         # 当前平台高亮
         cur = self.model.current.rect
         self.canvas.create_rectangle(
@@ -1095,60 +1490,35 @@ class OverlayApp:
             tags=("markers",),
         )
 
-        # 目标：双层虚线 + 标签
-        target = level.target.rect
-        self._target_outline_ids.append(
+        # 可选星星
+        for star in course.bonus_stars:
+            if star.uid in self.model.collected_star_uids:
+                continue
+            r = star.rect
             self.canvas.create_rectangle(
-                target.left - 3,
-                target.top - 3,
-                target.right + 3,
-                target.bottom + 3,
-                outline=COL_AMBER,
-                width=3,
-                dash=(8, 5),
-                tags=("markers", "target_outline"),
-            )
-        )
-        self._target_outline_ids.append(
-            self.canvas.create_rectangle(
-                target.left + 2,
-                target.top + 2,
-                target.right - 2,
-                target.bottom - 2,
-                outline=COL_AMBER_SOFT,
+                r.left,
+                r.top,
+                r.right,
+                r.bottom,
+                outline=COL_STAR,
                 width=1,
-                dash=(3, 7),
-                tags=("markers", "target_outline"),
+                dash=(2, 5),
+                tags=("markers",),
             )
-        )
-        label_text = f"目标 · {platform_display_name(level.target)}"
-        label_w = min(360, max(150, len(label_text) * 13 + 28))
-        lx = clamp(target.center_x, 12 + label_w / 2, self.screen.right - 12 - label_w / 2)
-        ly = target.top - 26 if target.top > 80 else target.bottom + 26
-        self._pill(
-            lx - label_w / 2,
-            ly - 15,
-            lx + label_w / 2,
-            ly + 15,
-            COL_PANEL,
-            COL_AMBER,
-            9,
-            tags=("markers",),
-        )
-        self.canvas.create_text(
-            lx,
-            ly,
-            text=truncate_text(label_text, 30),
-            fill=COL_AMBER_SOFT,
-            font=FONT_SMALL_BOLD,
-            tags=("markers",),
-        )
+            self._draw_badge(
+                r.right - 26,
+                max(20, r.top - 16),
+                "★",
+                COL_PANEL,
+                COL_STAR,
+                COL_STAR,
+                width=22,
+            )
 
     def _draw_hud(self) -> None:
         if self.model is None:
             return
         w = self.screen.width
-        # 品牌
         self._pill(20, 18, 338, 82, COL_PANEL, COL_LINE, 12)
         self.canvas.create_text(
             38,
@@ -1156,29 +1526,27 @@ class OverlayApp:
             text=APP_NAME,
             anchor="w",
             fill=COL_AQUA,
-            font=("Consolas", -19, "bold"),
+            font=("Consolas", -17, "bold"),
         )
-        title = self._window_label()
         self.canvas.create_text(
             38,
             61,
-            text=truncate_text(title, 38),
+            text=truncate_text(self._window_label(), 38),
             anchor="w",
             fill=COL_MUTED,
             font=FONT_SMALL,
         )
 
-        # 目标
         target_x1 = max(360, w / 2 - 250)
         target_x2 = min(w - 340, w / 2 + 250)
         if target_x2 - target_x1 < 280:
             target_x1 = w / 2 - 200
             target_x2 = w / 2 + 200
         self._pill(target_x1, 18, target_x2, 82, COL_PANEL, COL_AMBER, 12)
-        self.canvas.create_text(
+        self._hud_progress_id = self.canvas.create_text(
             (target_x1 + target_x2) / 2,
-            36,
-            text="当前目标",
+            35,
+            text="下一站",
             fill=COL_AMBER,
             font=FONT_SMALL,
         )
@@ -1190,50 +1558,77 @@ class OverlayApp:
             font=FONT_BODY_BOLD,
         )
 
-        # 统计
-        stat_x1 = w - 320
+        stat_x1 = w - 330
         self._pill(stat_x1, 18, w - 20, 82, COL_PANEL, COL_LINE, 12)
         self._hud_stats_id = self.canvas.create_text(
-            stat_x1 + 16,
-            38,
+            stat_x1 + 14,
+            36,
             anchor="w",
             text="",
             fill=COL_TEXT,
             font=FONT_SMALL_BOLD,
         )
-        self.canvas.create_text(
-            stat_x1 + 16,
-            61,
+        self._hud_combo_id = self.canvas.create_text(
+            stat_x1 + 14,
+            59,
             anchor="w",
-            text="R 新关卡 · Esc 退出",
+            text="",
             fill=COL_MUTED,
             font=FONT_SMALL,
         )
         self._refresh_hud()
 
     def _window_label(self) -> str:
-        if self._last_scan is not None:
-            if self.scope == "desktop":
-                return "范围：整个桌面"
-            scope = "窗口"
-            return f"{scope}：{self.window_title}"
         if self.scope == "desktop":
             return "范围：整个桌面"
         return f"窗口：{self.window_title}"
 
+    def _hearts_text(self) -> str:
+        if self.model is None:
+            return ""
+        left = self.model.hearts_left
+        if left is None:
+            return "♥ 无限"
+        total = max(self.run_config.hearts, left)
+        total = min(9, total)
+        return "♥" * left + "♡" * max(0, total - left)
+
     def _refresh_hud(self) -> None:
         if self.model is None or self.mode not in ("playing",):
             return
+        target = self.model.next_target
         if self._hud_target_id is not None:
+            text = (
+                platform_display_name(target)
+                if target is not None
+                else "全部检查点完成"
+            )
+            self.canvas.itemconfigure(self._hud_target_id, text=text)
+        if self._hud_progress_id is not None:
             self.canvas.itemconfigure(
-                self._hud_target_id,
-                text=platform_display_name(self.model.level.target),
+                self._hud_progress_id,
+                text=(
+                    f"检查点 {self.model.checkpoint_index}/"
+                    f"{len(self.model.course.checkpoints)} · 下一站"
+                ),
             )
         if self._hud_stats_id is not None:
-            stats = f"跳跃 {self.model.jumps}  ·  坠落 {self.model.falls}"
-            if self.model.limit_retries:
-                stats += f"  ·  剩余 {self.model.remaining_retries}"
-            self.canvas.itemconfigure(self._hud_stats_id, text=stats)
+            self.canvas.itemconfigure(
+                self._hud_stats_id,
+                text=(
+                    f"分数 {self.model.score}   ·   "
+                    f"连击 x{self.model.combo_multiplier:.1f}"
+                ),
+            )
+        if self._hud_combo_id is not None:
+            self.canvas.itemconfigure(
+                self._hud_combo_id,
+                text=(
+                    f"{self._hearts_text()}   ·   "
+                    f"★ {self.model.stars_collected}/{self.model.stars_total}"
+                    f"   ·   BEST {self._best_score}"
+                ),
+            )
 
     def _draw_character(self) -> None:
         if self.model is None:
@@ -1355,11 +1750,20 @@ class OverlayApp:
         y2 = h - 38
         outline = COL_AMBER if charging and self.model.power >= 0.999 else COL_LINE
         self._pill(x1, y1, x2, y2, COL_PANEL, outline, 14, tags=("dynamic",))
+        self.canvas.create_text(
+            x2 - 16,
+            y1 + 16,
+            anchor="e",
+            text=f"用时 {self.model.elapsed:5.1f}s",
+            fill=COL_MUTED,
+            font=FONT_SMALL,
+            tags=("dynamic",),
+        )
 
         if charging:
             percent = int(round(self.model.power * 100))
             distance = int(round(jump_distance(self.model.power)))
-            label = f"蓄力 {percent:>3d}%   ·   预计 {distance:>4d} px"
+            label = f"蓄力 {percent:>3d}% · {distance:>4d}px"
             self.canvas.create_text(
                 x1 + 18,
                 y1 + 18,
@@ -1410,7 +1814,7 @@ class OverlayApp:
                     tags=("dynamic",),
                 )
         else:
-            text = "←  →  切换方向    ·    长按空格蓄力    ·    松开起跳"
+            text = "← → 换方向 · 空格蓄力 · 松开起跳 · M 静音"
             self.canvas.create_text(
                 w / 2,
                 (y1 + y2) / 2,
@@ -1488,14 +1892,34 @@ class OverlayApp:
         if self.model is None or self.mode != "playing":
             return
 
+        self._draw_trail()
         self._draw_trajectory()
         self._draw_particles()
         self._draw_direction()
         self._draw_character()
+        self._draw_popups()
         self._draw_charge_ui()
         self._draw_toast(now)
         if self.focus_lost:
             self._draw_focus_banner()
+
+    def _draw_trail(self) -> None:
+        if self.model is None or self.model.state != STATE_AIRBORNE:
+            return
+        direction = 1 if self.model.direction >= 0 else -1
+        for index in range(1, 5):
+            tx = self.model.char_x - direction * index * 9
+            ty = self.model.char_feet - CHAR_SIZE / 2 + index * 2
+            radius = max(1.0, 4.0 - index * 0.6)
+            self.canvas.create_oval(
+                tx - radius,
+                ty - radius,
+                tx + radius,
+                ty + radius,
+                fill=COL_AQUA_DIM,
+                outline="",
+                tags=("dynamic",),
+            )
 
     def _pulse_target(self, now: float) -> None:
         if not self._target_outline_ids:
@@ -1606,104 +2030,109 @@ class OverlayApp:
             y=h / 2 + 84,
         )
 
-    def _draw_victory_card(self) -> None:
-        self.mode = "victory"
-        self.canvas.delete("all")
-        self._card_buttons = []
-        self._hover_button = None
-        self.canvas.configure(cursor="arrow")
-        self._draw_card_shell(COL_GREEN)
-        w, h = self.screen.width, self.screen.height
-        assert self.model is not None
-        # 简单彩屑
-        rng = random.Random(7)
-        for _ in range(28):
-            x = rng.uniform(w / 2 - 270, w / 2 + 270)
-            y = rng.uniform(h / 2 - 150, h / 2 + 130)
-            color = rng.choice((COL_AQUA, COL_AMBER, COL_GREEN, COL_TEXT))
-            size = rng.uniform(2, 5)
-            self.canvas.create_oval(
-                x,
-                y,
-                x + size,
-                y + size,
-                fill=color,
-                outline="",
-                tags=("card",),
-            )
-        self.canvas.create_text(
-            w / 2,
-            h / 2 - 110,
-            text="落点命中！",
-            fill=COL_GREEN,
-            font=("Microsoft YaHei UI", -42, "bold"),
-            tags=("card",),
-        )
-        self.canvas.create_text(
-            w / 2,
-            h / 2 - 55,
-            text=f"你落到了目标控件 · {platform_display_name(self.model.level.target)}",
-            fill=COL_TEXT,
-            font=FONT_BODY_BOLD,
-            tags=("card",),
-        )
-        stats = (
-            f"跳跃 {self.model.jumps} 次   ·   坠落 {self.model.falls} 次"
-            f"   ·   剩余机会 {self.model.remaining_retries if self.model.limit_retries else '无限'}"
-        )
-        self.canvas.create_text(
-            w / 2,
-            h / 2 - 12,
-            text=stats,
-            fill=COL_MUTED,
-            font=FONT_SMALL,
-            tags=("card",),
-        )
-        self._draw_card_buttons(
-            [("restart", "再玩一局"), ("quit", "退出")],
-            y=h / 2 + 70,
-        )
-        self.canvas.create_text(
-            w / 2,
-            h / 2 + 126,
-            text="键盘焦点已释放；点击按钮继续，点击卡片后也可用 R / Esc。",
-            fill=COL_MUTED,
-            font=FONT_SMALL,
-            tags=("card",),
-        )
+    def _format_time(self, seconds: float) -> str:
+        minutes = int(seconds // 60)
+        rest = seconds - minutes * 60
+        return f"{minutes:02d}:{rest:04.1f}"
 
-    def _draw_game_over_card(self) -> None:
-        self.mode = "game_over"
+    def _draw_result_card(self) -> None:
         self.canvas.delete("all")
         self._card_buttons = []
         self._hover_button = None
         self.canvas.configure(cursor="arrow")
-        self._draw_card_shell(COL_AMBER)
+        if self.model is None:
+            return
+        result = self._run_result or self.model.result
+        if result is None:
+            return
+        completed = result.completed
+        accent = COL_GREEN if completed else COL_RED
+        self._draw_card_shell(accent)
         w, h = self.screen.width, self.screen.height
-        assert self.model is not None
+        title = "巡回完成！" if completed else "体力耗尽"
+        rating_text = "★" * result.rating + "☆" * (3 - result.rating)
+        if completed:
+            rng = random.Random(7)
+            for _ in range(24):
+                x = rng.uniform(w / 2 - 280, w / 2 + 280)
+                y = rng.uniform(h / 2 - 160, h / 2 + 130)
+                color = rng.choice((COL_AQUA, COL_AMBER, COL_GREEN, COL_TEXT))
+                size = rng.uniform(2, 5)
+                self.canvas.create_oval(
+                    x, y, x + size, y + size, fill=color, outline="", tags=("card",)
+                )
         self.canvas.create_text(
             w / 2,
-            h / 2 - 88,
-            text="机会用尽",
-            fill=COL_AMBER,
-            font=("Microsoft YaHei UI", -42, "bold"),
+            h / 2 - 122,
+            text=title,
+            fill=accent,
+            font=("Microsoft YaHei UI", -38, "bold"),
             tags=("card",),
         )
         self.canvas.create_text(
             w / 2,
-            h / 2 - 30,
-            text=f"本局跳跃 {self.model.jumps} 次，坠落 {self.model.falls} 次。",
+            h / 2 - 80,
+            text=f"得分  {result.score}",
             fill=COL_TEXT,
-            font=FONT_BODY,
+            font=("Consolas", -26, "bold"),
+            tags=("card",),
+        )
+        self.canvas.create_text(
+            w / 2,
+            h / 2 - 42,
+            text=rating_text,
+            fill=COL_AMBER if result.rating else COL_MUTED,
+            font=("Microsoft YaHei UI", -24, "bold"),
+            tags=("card",),
+        )
+        detail = (
+            f"用时 {self._format_time(result.elapsed)}   ·   "
+            f"Perfect {result.perfect_count}   ·   "
+            f"Direct {result.direct_count}"
+        )
+        self.canvas.create_text(
+            w / 2,
+            h / 2 - 6,
+            text=detail,
+            fill=COL_MUTED,
+            font=FONT_SMALL,
+            tags=("card",),
+        )
+        journey = (
+            f"检查点 {self.model.checkpoint_index}/{len(self.model.course.checkpoints)}"
+            f"   ·   星星 {result.stars_collected}/{result.stars_total}"
+            f"   ·   坠落 {result.falls}"
+        )
+        self.canvas.create_text(
+            w / 2,
+            h / 2 + 22,
+            text=journey,
+            fill=COL_TEXT,
+            font=FONT_SMALL_BOLD,
+            tags=("card",),
+        )
+        best_text = f"本地最佳 {self._best_score}"
+        if self.progress.best_time is not None:
+            best_text += f"   ·   最快 {self._format_time(self.progress.best_time)}"
+        if self.progress.best_stars:
+            best_text += "   ·   " + "★" * self.progress.best_stars
+        if self._new_best:
+            best_text = "NEW BEST!   " + best_text
+        self.canvas.create_text(
+            w / 2,
+            h / 2 + 52,
+            text=best_text,
+            fill=COL_AMBER if self._new_best else COL_MUTED,
+            font=FONT_SMALL_BOLD,
             tags=("card",),
         )
         self._draw_card_buttons(
-            [("restart", "再玩一局"), ("quit", "退出")],
-            y=h / 2 + 60,
+            [("restart", "再来一局"), ("quit", "退出")],
+            y=h / 2 + 106,
         )
         self.canvas.create_text(
             w / 2,
-            h / 2 + 116,
+            h / 2 + 152,
             text="键盘焦点已释放；点击按钮继续，点击卡片后也可用 R / Esc。",
             fill=COL_MUTED,
             font=FONT_SMALL,
@@ -1840,8 +2269,8 @@ def run_windows(args: Any) -> int:
             scope,
             hwnd,
             window_title,
-            limit_retries=bool(args.limit_retries),
-            max_retries=max(1, int(args.max_retries)),
+            run_config=getattr(args, "run_config", None),
+            muted=bool(getattr(args, "mute", False)),
         )
         app.run()
         return 0

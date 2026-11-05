@@ -19,6 +19,7 @@ import ApplicationServices as AS
 
 from dango_core import (
     MAC_CANDIDATE_CONTROL_TYPES,
+    MIN_CONTROL_SIZE,
     MONITOR_INTERVAL_MS,
     RawControl,
     Rect,
@@ -535,24 +536,38 @@ def scan_desktop(
     )
 
 
+def read_platform_frame_ax(platform: Any) -> Rect | None:
+    """读取 AX 控件实时 frame；隐藏/读不到时返回 None。"""
+    node = getattr(platform, "element", None)
+    if node is None:
+        return platform.source_rect
+    try:
+        if _node_hidden(node):
+            return None
+        return _read_frame(node)
+    except Exception:
+        return None
+
+
+def update_platform_from_frame_ax(platform: Any, frame: Rect, screen: Rect) -> bool:
+    if frame is None:
+        return False
+    clipped = frame.intersect(screen)
+    if clipped is None or clipped.width < MIN_CONTROL_SIZE or clipped.height < MIN_CONTROL_SIZE:
+        return False
+    platform.source_rect = frame
+    platform.rect = clipped
+    return True
+
+
 def platform_is_live_ax(
     platform: Any, tolerance: int = TARGET_MOVE_TOLERANCE
 ) -> bool:
     """检查 AX 控件是否仍存在、未移动、未被隐藏。"""
-    node = getattr(platform, "element", None)
-    if node is None:
-        return True
-    try:
-        if _node_hidden(node):
-            return False
-        if not _node_enabled(node):
-            return False
-        frame = _read_frame(node)
-        if frame is None:
-            return False
-        return not rects_differ(platform.source_rect, frame, tolerance)
-    except Exception:
+    frame = read_platform_frame_ax(platform)
+    if frame is None:
         return False
+    return not rects_differ(platform.source_rect, frame, tolerance)
 
 
 __all__ = [
@@ -569,6 +584,8 @@ __all__ = [
     "scan_target",
     "scan_desktop",
     "scan_accessible_roots",
+    "read_platform_frame_ax",
+    "update_platform_from_frame_ax",
     "platform_is_live_ax",
     "MONITOR_INTERVAL_MS",
 ]
